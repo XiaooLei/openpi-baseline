@@ -1,11 +1,15 @@
 import asyncio
+import io
 import http
 import logging
 import time
 import traceback
+from typing import Any
 
+import numpy as np
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
+from PIL import Image
 import websockets.asyncio.server as _server
 import websockets.frames
 
@@ -41,6 +45,11 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            # WAN clients send multi-MB image observations through an SSH reverse
+            # tunnel. Disable server-side websocket keepalive pings so a slow or
+            # temporarily busy client isn't closed while uploading / rendering.
+            ping_interval=None,
+            close_timeout=10,
             process_request=_health_check,
         ) as server:
             await server.serve_forever()
@@ -50,12 +59,22 @@ class WebsocketPolicyServer:
         packer = msgpack_numpy.Packer()
 
         await websocket.send(packer.pack(self._metadata))
+        logger.info("Metadata sent to %s: keys=%s", websocket.remote_address, sorted(self._metadata.keys()))
 
         prev_total_time = None
         while True:
             try:
                 start_time = time.monotonic()
-                obs = msgpack_numpy.unpackb(await websocket.recv())
+                raw_obs = await websocket.recv()
+                recv_time = time.monotonic() - start_time
+                logger.info(
+                    "Observation received from %s: frame_type=%s bytes=%s recv_ms=%.1f",
+                    websocket.remote_address,
+                    type(raw_obs).__name__,
+                    len(raw_obs) if hasattr(raw_obs, "__len__") else None,
+                    recv_time * 1000,
+                )
+                obs = _decode_compressed_images(msgpack_numpy.unpackb(raw_obs))
 
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
@@ -70,6 +89,13 @@ class WebsocketPolicyServer:
 
                 await websocket.send(packer.pack(action))
                 prev_total_time = time.monotonic() - start_time
+                logger.info(
+                    "Inference succeeded for %s: action_shape=%s infer_ms=%.1f total_ms=%.1f",
+                    websocket.remote_address,
+                    _get_action_shape(action),
+                    infer_time * 1000,
+                    prev_total_time * 1000,
+                )
 
             except websockets.ConnectionClosed:
                 logger.info(f"Connection from {websocket.remote_address} closed")
@@ -88,3 +114,50 @@ def _health_check(connection: _server.ServerConnection, request: _server.Request
         return connection.respond(http.HTTPStatus.OK, "OK\n")
     # Continue with the normal request handling.
     return None
+
+
+def _decode_compressed_images(obs: dict[str, Any]) -> dict[str, Any]:
+    """Accept JPEG/PNG bytes in obs['images'] and convert them to CHW uint8.
+
+    The original OpenPI websocket client sends raw numpy arrays, which are still
+    supported. WAN clients can instead send the JPEG bytes already present in
+    policy_deployment sim bundles; this reduces each 3-camera observation from
+    ~2.77 MB to ~0.28 MB before it enters the SSH reverse tunnel.
+    """
+
+    images = obs.get("images")
+    if not isinstance(images, dict):
+        return obs
+
+    decoded_any = False
+    decoded_images: dict[str, Any] = {}
+    encoded_bytes = 0
+    decoded_shapes: dict[str, tuple[int, ...]] = {}
+
+    for key, value in images.items():
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            raw = bytes(value)
+            encoded_bytes += len(raw)
+            with Image.open(io.BytesIO(raw)) as image:
+                arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+            decoded = np.ascontiguousarray(arr.transpose(2, 0, 1))
+            decoded_images[key] = decoded
+            decoded_shapes[key] = tuple(decoded.shape)
+            decoded_any = True
+        else:
+            decoded_images[key] = value
+
+    if decoded_any:
+        obs = dict(obs)
+        obs["images"] = decoded_images
+        logger.info(
+            "Decoded compressed observation images: encoded_bytes=%s decoded_shapes=%s",
+            encoded_bytes,
+            decoded_shapes,
+        )
+    return obs
+
+
+def _get_action_shape(action: dict[str, Any]) -> tuple[int, ...] | None:
+    actions = action.get("actions")
+    return tuple(actions.shape) if hasattr(actions, "shape") else None
