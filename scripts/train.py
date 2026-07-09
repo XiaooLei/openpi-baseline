@@ -308,6 +308,7 @@ def main(config: _config.TrainConfig):
             sharding=data_sharding,
             shuffle=True,
             num_batches=config.num_heldin_eval_batches,
+            data_config_factory=config.heldin_eval_data,
             num_workers=min(config.num_workers, 8),
         )
 

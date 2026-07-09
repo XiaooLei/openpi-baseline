@@ -732,6 +732,8 @@ class TrainConfig:
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
     # Optional held-out data used only for action-MAE eval. If omitted, eval uses the training data config.
     eval_data: tyro.conf.Suppress[DataConfigFactory | None] = None
+    # Optional held-in data used only for action-MAE eval. If omitted, held-in eval uses the training data config.
+    heldin_eval_data: tyro.conf.Suppress[DataConfigFactory | None] = None
 
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
@@ -813,6 +815,7 @@ _SEAL_MEMORY_TRAIN_EPISODES = tuple(
 _SEAL_MEMORY_EXPERT_TRAIN_EPISODES = tuple(
     ep for ep in range(0, 379) if ep not in _SEAL_MEMORY_VAL_EPISODES
 )
+_SEAL_MEMORY_EXPERT_VAL_EPISODES = tuple(ep for ep in _SEAL_MEMORY_VAL_EPISODES if ep < 379)
 _SEAL_MEMORY_HIL_SUFFIX_TRAIN_EPISODES = tuple(
     ep for ep in range(379, 547) if ep not in _SEAL_MEMORY_VAL_EPISODES
 )
@@ -1234,7 +1237,24 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 local_files_path=_SEAL_MIXED_DATA_PATH,
-                episodes=_SEAL_MEMORY_VAL_EPISODES,
+                episodes=_SEAL_MEMORY_EXPERT_VAL_EPISODES,
+            ),
+            assets=AssetsConfig(
+                assets_dir=_SEAL_WATER120_ASSETS_DIR,
+                asset_id=_SEAL_WATER120_ASSET_ID,
+            ),
+            state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+            state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        heldin_eval_data=DualYamMemoryDataConfig(
+            repo_id="seal-water-bottle-cap/expert-success-hil-suffix-mix-data",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path=_SEAL_MIXED_DATA_PATH,
+                episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES,
+                frame_stride=2,
             ),
             assets=AssetsConfig(
                 assets_dir=_SEAL_WATER120_ASSETS_DIR,
@@ -1343,7 +1363,24 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 local_files_path=_SEAL_MIXED_DATA_PATH,
-                episodes=_SEAL_MEMORY_VAL_EPISODES,
+                episodes=_SEAL_MEMORY_EXPERT_VAL_EPISODES,
+            ),
+            assets=AssetsConfig(
+                assets_dir=_SEAL_WATER120_ASSETS_DIR,
+                asset_id=_SEAL_WATER120_ASSET_ID,
+            ),
+            state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
+            state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        heldin_eval_data=DualYamMemoryDataConfig(
+            repo_id="seal-water-bottle-cap/expert-success-hil-suffix-mix-data",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path=_SEAL_MIXED_DATA_PATH,
+                episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES,
+                frame_stride=2,
             ),
             assets=AssetsConfig(
                 assets_dir=_SEAL_WATER120_ASSETS_DIR,
