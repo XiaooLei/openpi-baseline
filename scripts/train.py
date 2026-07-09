@@ -140,6 +140,8 @@ def eval_step(
     params: at.Params,
     rng: at.KeyArrayLike,
     batch: tuple[_model.Observation, _model.Actions],
+    *,
+    log_per_dim_metrics: bool = False,
 ) -> dict[str, at.Array]:
     model = nnx.merge(model_def, params)
     model.eval()
@@ -157,18 +159,17 @@ def eval_step(
     mae_action_dims = jnp.mean(abs_err[..., :action_dims])
     rmse_action_dims = jnp.sqrt(jnp.mean(sq_err[..., :action_dims]))
 
-    # Per-action-dimension metrics averaged over batch and horizon.
-    mae_per_dim = jnp.mean(abs_err, axis=(0, 1))
-    rmse_per_dim = jnp.sqrt(jnp.mean(sq_err, axis=(0, 1)))
-
-    return {
+    metrics = {
         "eval/mae": mae,
         "eval/mae_action_dims": mae_action_dims,
         "eval/rmse": rmse,
         "eval/rmse_action_dims": rmse_action_dims,
-        "eval/mae_per_dim": mae_per_dim,
-        "eval/rmse_per_dim": rmse_per_dim,
     }
+    if log_per_dim_metrics:
+        # Per-action-dimension metrics averaged over batch and horizon. Keep this opt-in to avoid noisy TensorBoard runs.
+        metrics["eval/mae_per_dim"] = jnp.mean(abs_err, axis=(0, 1))
+        metrics["eval/rmse_per_dim"] = jnp.sqrt(jnp.mean(sq_err, axis=(0, 1)))
+    return metrics
 
 
 def flatten_metrics(metrics: dict[str, Any]) -> dict[str, float]:
@@ -335,6 +336,7 @@ def main(config: _config.TrainConfig):
         eval_step,
         in_shardings=(replicated_sharding, train_state_sharding.params, replicated_sharding, data_sharding),
         out_shardings=replicated_sharding,
+        static_argnames=("log_per_dim_metrics",),
     )
 
     start_step = int(train_state.step)
@@ -377,7 +379,11 @@ def main(config: _config.TrainConfig):
                             eval_rng, batch_rng = jax.random.split(eval_rng)
                             with sharding.set_mesh(mesh):
                                 eval_info = peval_step(
-                                    train_state.model_def, train_state.params, batch_rng, eval_batch
+                                    train_state.model_def,
+                                    train_state.params,
+                                    batch_rng,
+                                    eval_batch,
+                                    log_per_dim_metrics=config.log_eval_per_dim_metrics,
                                 )
                             eval_infos.append(eval_info)
                         stacked_eval = common_utils.stack_forest(eval_infos)

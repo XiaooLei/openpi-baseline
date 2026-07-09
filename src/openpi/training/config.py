@@ -756,6 +756,8 @@ class TrainConfig:
     num_eval_batches: int = 10
     # Number of training-data batches to sample for held-in action-MAE eval. Set to 0 to disable.
     num_heldin_eval_batches: int = 5
+    # If true, log per-action-dimension eval MAE/RMSE. This is verbose and usually only useful for debugging.
+    log_eval_per_dim_metrics: bool = False
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
