@@ -2118,6 +2118,26 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
 ]
 
+_SEAL_MEMORY42_PHASE2_CONFIG = next(
+    config for config in _CONFIGS if config.name == "pi05_seal-water-bottle-cap_memory42_phase2_bc"
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        _SEAL_MEMORY42_PHASE2_CONFIG,
+        name="pi05_seal-water-bottle-cap_memory42_phase2_bc_lr5e6",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-6,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+        num_train_steps=60_000,
+        num_eval_batches=30,
+        num_heldin_eval_batches=10,
+        keep_period=20_000,
+    )
+)
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
