@@ -54,6 +54,8 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._state_history_delta_indices = self._metadata.get("state_history_delta_indices")
+        self._state_history_buffer: list[np.ndarray] = []
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -68,6 +70,7 @@ class Policy(BasePolicy):
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._inject_state_history(inputs)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -109,6 +112,36 @@ class Policy(BasePolicy):
     def metadata(self) -> dict[str, Any]:
         return self._metadata
 
+    @override
+    def reset(self) -> None:
+        self._state_history_buffer = []
+
+    def _inject_state_history(self, obs: dict) -> dict:
+        if self._state_history_delta_indices is None or "state_history" in obs:
+            return obs
+        if "state" not in obs:
+            return obs
+
+        if any(bool(np.asarray(obs.get(key, False)).any()) for key in ("reset", "episode_start", "is_first")):
+            self._state_history_buffer = []
+
+        state = np.asarray(obs["state"])
+        self._state_history_buffer.append(state.copy())
+
+        max_lag = max(abs(int(offset)) for offset in self._state_history_delta_indices)
+        if len(self._state_history_buffer) > max_lag + 1:
+            self._state_history_buffer = self._state_history_buffer[-(max_lag + 1) :]
+
+        history = []
+        for offset in self._state_history_delta_indices:
+            index = len(self._state_history_buffer) - 1 + int(offset)
+            index = min(max(index, 0), len(self._state_history_buffer) - 1)
+            history.append(self._state_history_buffer[index])
+
+        obs = dict(obs)
+        obs["state_history"] = np.stack(history, axis=0)
+        return obs
+
 
 class PolicyRecorder(_base_policy.BasePolicy):
     """Records the policy's behavior to disk."""
@@ -133,3 +166,7 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         np.save(output_path, np.asarray(data))
         return results
+
+    @override
+    def reset(self) -> None:
+        self._policy.reset()

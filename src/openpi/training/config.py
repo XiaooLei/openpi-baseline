@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -86,6 +87,19 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+    # Additional LeRobot delta indices for observation keys. Values are frame offsets relative to the current
+    # frame, e.g. {"observation.state": (-3, -2, -1, 0)} returns a short state history.
+    observation_delta_indices: dict[str, Sequence[int]] = dataclasses.field(default_factory=dict)
+    # Optional LeRobot episode subset. If set, the loader only reads these episode indices.
+    episodes: Sequence[int] | None = None
+    # Optional frame stride for training anchors. This does not change dataset FPS or action chunk timestamps.
+    frame_stride: int = 1
+    # Video decoder backend for LeRobot datasets. Prefer pyav in offline images because torchcodec needs system FFmpeg libs.
+    video_backend: str | None = "pyav"
+    # Optional child configs for mixing multiple LeRobot datasets that share the same training transforms.
+    source_configs: tyro.conf.Suppress[Sequence[Any]] = ()
+    # Optional target sampling ratio per source config. If omitted, sampling is proportional to source length.
+    source_weights: tyro.conf.Suppress[tuple[float, ...]] = ()
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -226,6 +240,34 @@ class SimpleDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class MixtureDataConfig(DataConfigFactory):
+    """Mixes multiple data configs while reusing the transforms and assets from the first config."""
+
+    repo_id: str = "mixture"
+    data_configs: tyro.conf.Suppress[Sequence[DataConfigFactory]] = ()
+    source_weights: tyro.conf.Suppress[tuple[float, ...]] = ()
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if not self.data_configs:
+            raise ValueError("MixtureDataConfig requires at least one child data config.")
+        source_configs = tuple(data_config.create(assets_dirs, model_config) for data_config in self.data_configs)
+        if self.source_weights and len(self.source_weights) != len(source_configs):
+            raise ValueError(
+                f"source_weights length ({len(self.source_weights)}) must match source count ({len(source_configs)})."
+            )
+        if self.source_weights and any(weight <= 0 for weight in self.source_weights):
+            raise ValueError(f"source_weights must all be positive, got {self.source_weights}.")
+
+        return dataclasses.replace(
+            source_configs[0],
+            repo_id=self.repo_id,
+            source_configs=source_configs,
+            source_weights=tuple(self.source_weights),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotAlohaDataConfig(DataConfigFactory):
     # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
     # Gripper dimensions will remain in absolute values.
@@ -337,6 +379,102 @@ class DualYamDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class DualYamMemoryDataConfig(DualYamDataConfig):
+    """Dual-arm YAM data config that exposes sparse proprioception deltas to pi05 as discrete state context."""
+
+    state_history_delta_indices: Sequence[int] = (-120, -60, -30, -15, 0)
+    state_delta_pairs: Sequence[tuple[int, int]] = ((0, -15), (-15, -30), (-30, -60), (-60, -120))
+
+    repack_transforms: _transforms.Group = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state_history": "observation.state",
+                        "actions": "action",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+    )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        history_indices = tuple(self.state_history_delta_indices)
+        if 0 not in history_indices:
+            raise ValueError("state_history_delta_indices must include 0 so delta actions can use the current state.")
+        current_state_index = history_indices.index(0)
+        missing_delta_offsets = {
+            offset for pair in self.state_delta_pairs for offset in pair if offset not in history_indices
+        }
+        if missing_delta_offsets:
+            raise ValueError(
+                f"state_delta_pairs reference offsets not present in state_history_delta_indices: "
+                f"{sorted(missing_delta_offsets)}"
+            )
+
+        base_config = self.create_base_config(assets_dirs, model_config)
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                yam_policy.YamMemoryInputs(
+                    action_dim=model_config.action_dim,
+                    adapt_to_pi=self.adapt_to_pi,
+                    model_type=model_config.model_type,
+                    current_state_index=current_state_index,
+                )
+            ],
+            outputs=[yam_policy.YamOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        state_history_norm = []
+        if base_config.norm_stats is not None and "state" in base_config.norm_stats:
+            state_history_norm = [
+                _transforms.Normalize(
+                    {"state_history": base_config.norm_stats["state"]},
+                    use_quantiles=base_config.use_quantile_norm,
+                )
+            ]
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        model_transforms = _transforms.Group(
+            inputs=[
+                *state_history_norm,
+                yam_policy.SparseYamStateDeltaContext(
+                    state_history_delta_indices=history_indices,
+                    delta_pairs=tuple(self.state_delta_pairs),
+                ),
+                *model_transforms.inputs,
+            ],
+            outputs=model_transforms.outputs,
+        )
+
+        observation_delta_indices = dict(base_config.observation_delta_indices)
+        observation_delta_indices["observation.state"] = history_indices
+
+        return dataclasses.replace(
+            base_config,
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            observation_delta_indices=observation_delta_indices,
         )
 
 @dataclasses.dataclass(frozen=True)
@@ -483,6 +621,10 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
     To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
     """
 
+    # If true, convert absolute 7-DoF joint action targets to deltas relative to
+    # the current state. Leave gripper action absolute.
+    use_delta_joint_actions: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
@@ -504,6 +646,47 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         data_transforms = _transforms.Group(
             inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
             outputs=[droid_policy.DroidOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotDROIDEefDataConfig(DataConfigFactory):
+    """DROID-style image dataset with EEF state and delta-EEF actions."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/exterior_image_2_left": "exterior_image_2_left",
+                        "observation/wrist_image_left": "wrist_image_left",
+                        "observation/eef_position": "eef_position",
+                        "observation/gripper_position": "gripper_position",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[droid_policy.DroidEefInputs(model_type=model_config.model_type)],
+            outputs=[droid_policy.DroidEefOutputs()],
         )
         model_transforms = ModelTransformFactory()(model_config)
 
@@ -547,6 +730,8 @@ class TrainConfig:
 
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
+    # Optional held-out data used only for action-MAE eval. If omitted, eval uses the training data config.
+    eval_data: tyro.conf.Suppress[DataConfigFactory | None] = None
 
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
@@ -565,6 +750,12 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
+    # How often (in steps) to run evaluation (MAE between predicted and expert actions).
+    eval_interval: int = 500
+    # Number of batches to sample for evaluation.
+    num_eval_batches: int = 10
+    # Number of training-data batches to sample for held-in action-MAE eval. Set to 0 to disable.
+    num_heldin_eval_batches: int = 5
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -577,6 +768,8 @@ class TrainConfig:
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
+    # If true, will enable tensorboard logging (checkpoint_dir/tensorboard).
+    tensorboard_enabled: bool = False
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -610,6 +803,267 @@ class TrainConfig:
 
 
 # Use `get_config` if you need to get a config by name in your code.
+_SEAL_MEMORY_TOTAL_EPISODES = 603
+_SEAL_MEMORY_VAL_EPISODES = (24, 33, 38, 60, 213, 249, 271, 378, 437, 527, 550, 600)
+_SEAL_MEMORY_TRAIN_EPISODES = tuple(
+    ep for ep in range(_SEAL_MEMORY_TOTAL_EPISODES) if ep not in _SEAL_MEMORY_VAL_EPISODES
+)
+_SEAL_MEMORY_EXPERT_TRAIN_EPISODES = tuple(
+    ep for ep in range(0, 379) if ep not in _SEAL_MEMORY_VAL_EPISODES
+)
+_SEAL_MEMORY_HIL_SUFFIX_TRAIN_EPISODES = tuple(
+    ep for ep in range(379, 547) if ep not in _SEAL_MEMORY_VAL_EPISODES
+)
+_SEAL_MEMORY_SUCCESS_TRAIN_EPISODES = tuple(
+    ep for ep in range(547, 603) if ep not in _SEAL_MEMORY_VAL_EPISODES
+)
+_SEAL_MEMORY70_HISTORY_INDICES = (-120, -60, -30, -15, 0)
+_SEAL_MEMORY70_DELTA_PAIRS = ((0, -15), (-15, -30), (-30, -60), (-60, -120))
+_SEAL_MEMORY42_HISTORY_INDICES = (-120, -30, 0)
+_SEAL_MEMORY42_DELTA_PAIRS = ((0, -30), (0, -120))
+_RSS_DATA_ROOT = os.environ.get(
+    "RSS_DATA_ROOT",
+    "/inspire/qb-ilm/project/gjjproject/public/xl/data/rss_challenge",
+)
+_RSS_RAW_DATA_ROOT = f"{_RSS_DATA_ROOT}/raw"
+_RSS_PHASE2_RECAP_ROOT = f"{_RSS_DATA_ROOT}/recap/phase2"
+_RSS_BASELINE_CHECKPOINT_ROOT = os.environ.get(
+    "RSS_BASELINE_CHECKPOINT_ROOT",
+    "/inspire/qb-ilm/project/gjjproject/public/xl/data/baseline_checkpoints",
+)
+_RSS_SECOND_SUBMIT_CHECKPOINT_ROOT = (
+    os.environ.get("RSS_SECOND_SUBMIT_CHECKPOINT_ROOT") or f"{_RSS_BASELINE_CHECKPOINT_ROOT}/2nd-submit"
+)
+_SEAL_MIXED_DATA_PATH = f"{_RSS_RAW_DATA_ROOT}/seal-water-bottle-cap/expert-success-hil-suffix-mix-data"
+_SEAL_PHASE2_TRAIN_PATH = f"{_RSS_PHASE2_RECAP_ROOT}/seal_water_bottle_cap_hil_split/train"
+_SEAL_BASELINE_CHECKPOINT_DIR = f"{_RSS_BASELINE_CHECKPOINT_ROOT}/pi05_seal-water-bottle-cap/199999"
+_SEAL_BASELINE_ASSETS_DIR = f"{_SEAL_BASELINE_CHECKPOINT_DIR}/assets/v21"
+_INSERT_MEMORY_TOTAL_EPISODES = 1231
+_INSERT_MEMORY_VAL_EPISODES = (24, 120, 240, 360, 527, 720, 830, 860, 940, 1086, 1100, 1220)
+_INSERT_MEMORY_EXPERT_TRAIN_EPISODES = tuple(
+    ep for ep in range(0, 831) if ep not in _INSERT_MEMORY_VAL_EPISODES
+)
+_INSERT_MEMORY_HIL_SUFFIX_TRAIN_EPISODES = tuple(
+    ep for ep in range(831, 1087) if ep not in _INSERT_MEMORY_VAL_EPISODES
+)
+_INSERT_MEMORY_SUCCESS_TRAIN_EPISODES = tuple(
+    ep for ep in range(1087, 1231) if ep not in _INSERT_MEMORY_VAL_EPISODES
+)
+_TOWER_MEMORY_TOTAL_EPISODES = 1652
+_TOWER_MEMORY_VAL_EPISODES = (
+    24,
+    150,
+    300,
+    450,
+    600,
+    750,
+    900,
+    1003,
+    1050,
+    1200,
+    1400,
+    1471,
+    1500,
+    1580,
+    1651,
+)
+_TOWER_MEMORY_EXPERT_TRAIN_EPISODES = tuple(
+    ep for ep in range(0, 1004) if ep not in _TOWER_MEMORY_VAL_EPISODES
+)
+_TOWER_MEMORY_HIL_SUFFIX_TRAIN_EPISODES = tuple(
+    ep for ep in range(1004, 1472) if ep not in _TOWER_MEMORY_VAL_EPISODES
+)
+_TOWER_MEMORY_SUCCESS_TRAIN_EPISODES = tuple(
+    ep for ep in range(1472, 1652) if ep not in _TOWER_MEMORY_VAL_EPISODES
+)
+_SEAL_PHASE2_QUALITY60_EPISODES = (
+    57,
+    51,
+    167,
+    38,
+    90,
+    86,
+    176,
+    15,
+    140,
+    81,
+    111,
+    32,
+    115,
+    42,
+    82,
+    155,
+    151,
+    196,
+    156,
+    93,
+    141,
+    107,
+    104,
+    48,
+    110,
+    145,
+    65,
+    27,
+    4,
+    171,
+    189,
+    39,
+    62,
+    175,
+    46,
+    153,
+    108,
+    150,
+    40,
+    60,
+    188,
+    119,
+    33,
+    118,
+    34,
+    83,
+    144,
+    44,
+)
+
+
+def _rss_second_submit_assets(task_slug: str, checkpoint_subdir: str) -> AssetsConfig:
+    return AssetsConfig(
+        assets_dir=f"{_RSS_SECOND_SUBMIT_CHECKPOINT_ROOT}/{checkpoint_subdir}/assets",
+        asset_id=f"{task_slug}/expert-success-hil-suffix-mix-data",
+    )
+
+
+def _rss_memory_source_config(
+    *,
+    task_slug: str,
+    checkpoint_subdir: str,
+    episodes: Sequence[int] | None,
+    state_history_delta_indices: Sequence[int],
+    state_delta_pairs: Sequence[tuple[int, int]],
+    frame_stride: int = 1,
+) -> DualYamMemoryDataConfig:
+    return DualYamMemoryDataConfig(
+        repo_id=f"{task_slug}/expert-success-hil-suffix-mix-data",
+        base_config=DataConfig(
+            prompt_from_task=True,
+            local_files_path=f"{_RSS_RAW_DATA_ROOT}/{task_slug}/expert-success-hil-suffix-mix-data",
+            episodes=episodes,
+            frame_stride=frame_stride,
+        ),
+        assets=_rss_second_submit_assets(task_slug, checkpoint_subdir),
+        state_history_delta_indices=state_history_delta_indices,
+        state_delta_pairs=state_delta_pairs,
+        use_delta_joint_actions=True,
+        adapt_to_pi=True,
+    )
+
+
+def _rss_memory_phase2_source_config(
+    *,
+    task_slug: str,
+    phase2_slug: str,
+    checkpoint_subdir: str,
+    state_history_delta_indices: Sequence[int],
+    state_delta_pairs: Sequence[tuple[int, int]],
+) -> DualYamMemoryDataConfig:
+    return DualYamMemoryDataConfig(
+        repo_id=f"{phase2_slug}_hil_split/train",
+        base_config=DataConfig(
+            prompt_from_task=True,
+            local_files_path=f"{_RSS_PHASE2_RECAP_ROOT}/{phase2_slug}_hil_split/train",
+        ),
+        assets=_rss_second_submit_assets(task_slug, checkpoint_subdir),
+        state_history_delta_indices=state_history_delta_indices,
+        state_delta_pairs=state_delta_pairs,
+        use_delta_joint_actions=True,
+        adapt_to_pi=True,
+    )
+
+
+def _rss_memory_phase2_bc_config(
+    *,
+    task_slug: str,
+    phase2_slug: str,
+    checkpoint_subdir: str,
+    memory_dim: int,
+    state_history_delta_indices: Sequence[int],
+    state_delta_pairs: Sequence[tuple[int, int]],
+    max_token_len: int,
+    expert_train_episodes: Sequence[int],
+    hil_suffix_train_episodes: Sequence[int],
+    success_train_episodes: Sequence[int],
+    val_episodes: Sequence[int],
+) -> TrainConfig:
+    return TrainConfig(
+        name=f"pi05_{task_slug}_memory{memory_dim}_phase2_bc",
+        model=pi0_config.Pi0Config(pi05=True, max_token_len=max_token_len),
+        data=MixtureDataConfig(
+            repo_id=f"{task_slug}/memory{memory_dim}-expert-phase2",
+            source_weights=(0.47, 0.21, 0.07, 0.25),
+            data_configs=(
+                _rss_memory_source_config(
+                    task_slug=task_slug,
+                    checkpoint_subdir=checkpoint_subdir,
+                    episodes=expert_train_episodes,
+                    frame_stride=2,
+                    state_history_delta_indices=state_history_delta_indices,
+                    state_delta_pairs=state_delta_pairs,
+                ),
+                _rss_memory_source_config(
+                    task_slug=task_slug,
+                    checkpoint_subdir=checkpoint_subdir,
+                    episodes=hil_suffix_train_episodes,
+                    state_history_delta_indices=state_history_delta_indices,
+                    state_delta_pairs=state_delta_pairs,
+                ),
+                _rss_memory_source_config(
+                    task_slug=task_slug,
+                    checkpoint_subdir=checkpoint_subdir,
+                    episodes=success_train_episodes,
+                    state_history_delta_indices=state_history_delta_indices,
+                    state_delta_pairs=state_delta_pairs,
+                ),
+                _rss_memory_phase2_source_config(
+                    task_slug=task_slug,
+                    phase2_slug=phase2_slug,
+                    checkpoint_subdir=checkpoint_subdir,
+                    state_history_delta_indices=state_history_delta_indices,
+                    state_delta_pairs=state_delta_pairs,
+                ),
+            ),
+        ),
+        eval_data=_rss_memory_source_config(
+            task_slug=task_slug,
+            checkpoint_subdir=checkpoint_subdir,
+            episodes=val_episodes,
+            state_history_delta_indices=state_history_delta_indices,
+            state_delta_pairs=state_delta_pairs,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            f"{_RSS_SECOND_SUBMIT_CHECKPOINT_ROOT}/{checkpoint_subdir}/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2_000,
+            peak_lr=2e-5,
+            decay_steps=100_000,
+            decay_lr=2e-5,
+        ),
+        num_train_steps=300_000,
+        batch_size=32,
+        num_workers=64,
+        log_interval=50,
+        eval_interval=500,
+        num_eval_batches=10,
+        save_interval=20_000,
+        keep_period=50_000,
+        policy_metadata={
+            "state_history_delta_indices": tuple(state_history_delta_indices),
+        },
+    )
+
+
 _CONFIGS = [
     # Challenge Baseline Examples
     TrainConfig(
@@ -643,6 +1097,278 @@ _CONFIGS = [
         save_interval=40_000
     ),
     TrainConfig(
+        name="pi05_seal-water-bottle-cap_memory_specialist",
+        model=pi0_config.Pi0Config(pi05=True, max_token_len=320),
+        data=DualYamMemoryDataConfig(
+            repo_id="seal-water-bottle-cap/expert-success-hil-suffix-mix-data",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path=_SEAL_MIXED_DATA_PATH,
+                episodes=_SEAL_MEMORY_TRAIN_EPISODES,
+            ),
+            assets=AssetsConfig(
+                assets_dir=_SEAL_BASELINE_ASSETS_DIR,
+                asset_id="seal-water-bottle-cap",
+            ),
+            state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
+            state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        eval_data=DualYamMemoryDataConfig(
+            repo_id="seal-water-bottle-cap/expert-success-hil-suffix-mix-data",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path=_SEAL_MIXED_DATA_PATH,
+                episodes=_SEAL_MEMORY_VAL_EPISODES,
+            ),
+            assets=AssetsConfig(
+                assets_dir=_SEAL_BASELINE_ASSETS_DIR,
+                asset_id="seal-water-bottle-cap",
+            ),
+            state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
+            state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_SEAL_BASELINE_CHECKPOINT_DIR}/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-5,
+        ),
+        num_train_steps=300_000,
+        batch_size=32,
+        num_workers=64,
+        log_interval=50,
+        eval_interval=500,
+        num_eval_batches=10,
+        save_interval=20_000,
+        keep_period=50_000,
+        policy_metadata={
+            "state_history_delta_indices": _SEAL_MEMORY70_HISTORY_INDICES,
+        },
+    ),
+    TrainConfig(
+        name="pi05_seal-water-bottle-cap_memory42_phase2_bc",
+        model=pi0_config.Pi0Config(pi05=True, max_token_len=240),
+        data=MixtureDataConfig(
+            repo_id="seal-water-bottle-cap/memory-expert-phase2-q60",
+            source_weights=(0.47, 0.21, 0.07, 0.25),
+            data_configs=(
+                DualYamMemoryDataConfig(
+                    repo_id="seal-water-bottle-cap/expert-success-hil-suffix-mix-data",
+                    base_config=DataConfig(
+                        prompt_from_task=True,
+                        local_files_path=_SEAL_MIXED_DATA_PATH,
+                        episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES,
+                        frame_stride=2,
+                    ),
+                    assets=AssetsConfig(
+                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
+                        asset_id="seal-water-bottle-cap",
+                    ),
+                    state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+                    state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+                    use_delta_joint_actions=True,
+                    adapt_to_pi=True,
+                ),
+                DualYamMemoryDataConfig(
+                    repo_id="seal-water-bottle-cap/expert-success-hil-suffix-mix-data",
+                    base_config=DataConfig(
+                        prompt_from_task=True,
+                        local_files_path=_SEAL_MIXED_DATA_PATH,
+                        episodes=_SEAL_MEMORY_HIL_SUFFIX_TRAIN_EPISODES,
+                    ),
+                    assets=AssetsConfig(
+                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
+                        asset_id="seal-water-bottle-cap",
+                    ),
+                    state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+                    state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+                    use_delta_joint_actions=True,
+                    adapt_to_pi=True,
+                ),
+                DualYamMemoryDataConfig(
+                    repo_id="seal-water-bottle-cap/expert-success-hil-suffix-mix-data",
+                    base_config=DataConfig(
+                        prompt_from_task=True,
+                        local_files_path=_SEAL_MIXED_DATA_PATH,
+                        episodes=_SEAL_MEMORY_SUCCESS_TRAIN_EPISODES,
+                    ),
+                    assets=AssetsConfig(
+                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
+                        asset_id="seal-water-bottle-cap",
+                    ),
+                    state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+                    state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+                    use_delta_joint_actions=True,
+                    adapt_to_pi=True,
+                ),
+                DualYamMemoryDataConfig(
+                    repo_id="seal_water_bottle_cap_hil_split/train",
+                    base_config=DataConfig(
+                        prompt_from_task=True,
+                        local_files_path=_SEAL_PHASE2_TRAIN_PATH,
+                        episodes=_SEAL_PHASE2_QUALITY60_EPISODES,
+                    ),
+                    assets=AssetsConfig(
+                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
+                        asset_id="seal-water-bottle-cap",
+                    ),
+                    state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+                    state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+                    use_delta_joint_actions=True,
+                    adapt_to_pi=True,
+                ),
+            ),
+        ),
+        eval_data=DualYamMemoryDataConfig(
+            repo_id="seal-water-bottle-cap/expert-success-hil-suffix-mix-data",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path=_SEAL_MIXED_DATA_PATH,
+                episodes=_SEAL_MEMORY_VAL_EPISODES,
+            ),
+            assets=AssetsConfig(
+                assets_dir=_SEAL_BASELINE_ASSETS_DIR,
+                asset_id="seal-water-bottle-cap",
+            ),
+            state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+            state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_SEAL_BASELINE_CHECKPOINT_DIR}/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2_000,
+            peak_lr=2e-5,
+            decay_steps=100_000,
+            decay_lr=2e-5,
+        ),
+        num_train_steps=300_000,
+        batch_size=32,
+        num_workers=64,
+        log_interval=50,
+        eval_interval=500,
+        num_eval_batches=10,
+        save_interval=20_000,
+        keep_period=50_000,
+        policy_metadata={
+            "state_history_delta_indices": _SEAL_MEMORY42_HISTORY_INDICES,
+        },
+    ),
+    TrainConfig(
+        name="pi05_seal-water-bottle-cap_memory70_phase2_bc",
+        model=pi0_config.Pi0Config(pi05=True, max_token_len=320),
+        data=MixtureDataConfig(
+            repo_id="seal-water-bottle-cap/memory70-expert-phase2-q60",
+            source_weights=(0.47, 0.21, 0.07, 0.25),
+            data_configs=(
+                DualYamMemoryDataConfig(
+                    repo_id="seal-water-bottle-cap/expert-success-hil-suffix-mix-data",
+                    base_config=DataConfig(
+                        prompt_from_task=True,
+                        local_files_path=_SEAL_MIXED_DATA_PATH,
+                        episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES,
+                        frame_stride=2,
+                    ),
+                    assets=AssetsConfig(
+                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
+                        asset_id="seal-water-bottle-cap",
+                    ),
+                    state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
+                    state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
+                    use_delta_joint_actions=True,
+                    adapt_to_pi=True,
+                ),
+                DualYamMemoryDataConfig(
+                    repo_id="seal-water-bottle-cap/expert-success-hil-suffix-mix-data",
+                    base_config=DataConfig(
+                        prompt_from_task=True,
+                        local_files_path=_SEAL_MIXED_DATA_PATH,
+                        episodes=_SEAL_MEMORY_HIL_SUFFIX_TRAIN_EPISODES,
+                    ),
+                    assets=AssetsConfig(
+                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
+                        asset_id="seal-water-bottle-cap",
+                    ),
+                    state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
+                    state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
+                    use_delta_joint_actions=True,
+                    adapt_to_pi=True,
+                ),
+                DualYamMemoryDataConfig(
+                    repo_id="seal-water-bottle-cap/expert-success-hil-suffix-mix-data",
+                    base_config=DataConfig(
+                        prompt_from_task=True,
+                        local_files_path=_SEAL_MIXED_DATA_PATH,
+                        episodes=_SEAL_MEMORY_SUCCESS_TRAIN_EPISODES,
+                    ),
+                    assets=AssetsConfig(
+                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
+                        asset_id="seal-water-bottle-cap",
+                    ),
+                    state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
+                    state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
+                    use_delta_joint_actions=True,
+                    adapt_to_pi=True,
+                ),
+                DualYamMemoryDataConfig(
+                    repo_id="seal_water_bottle_cap_hil_split/train",
+                    base_config=DataConfig(
+                        prompt_from_task=True,
+                        local_files_path=_SEAL_PHASE2_TRAIN_PATH,
+                        episodes=_SEAL_PHASE2_QUALITY60_EPISODES,
+                    ),
+                    assets=AssetsConfig(
+                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
+                        asset_id="seal-water-bottle-cap",
+                    ),
+                    state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
+                    state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
+                    use_delta_joint_actions=True,
+                    adapt_to_pi=True,
+                ),
+            ),
+        ),
+        eval_data=DualYamMemoryDataConfig(
+            repo_id="seal-water-bottle-cap/expert-success-hil-suffix-mix-data",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path=_SEAL_MIXED_DATA_PATH,
+                episodes=_SEAL_MEMORY_VAL_EPISODES,
+            ),
+            assets=AssetsConfig(
+                assets_dir=_SEAL_BASELINE_ASSETS_DIR,
+                asset_id="seal-water-bottle-cap",
+            ),
+            state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
+            state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_SEAL_BASELINE_CHECKPOINT_DIR}/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2_000,
+            peak_lr=2e-5,
+            decay_steps=100_000,
+            decay_lr=2e-5,
+        ),
+        num_train_steps=300_000,
+        batch_size=32,
+        num_workers=64,
+        log_interval=50,
+        eval_interval=500,
+        num_eval_batches=10,
+        save_interval=20_000,
+        keep_period=50_000,
+        policy_metadata={
+            "state_history_delta_indices": _SEAL_MEMORY70_HISTORY_INDICES,
+        },
+    ),
+    TrainConfig(
         name="pi05_tower-of-hanoi-game",
         model=pi0_config.Pi0Config(pi05=True),
         data=DualYamDataConfig(
@@ -656,6 +1382,118 @@ _CONFIGS = [
         batch_size=32,
         num_workers=64,
         save_interval=40_000
+    ),
+    _rss_memory_phase2_bc_config(
+        task_slug="insert-mouse-battery",
+        phase2_slug="insert_mouse_battery",
+        checkpoint_subdir="mouse_80k",
+        memory_dim=42,
+        state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+        state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+        max_token_len=240,
+        expert_train_episodes=_INSERT_MEMORY_EXPERT_TRAIN_EPISODES,
+        hil_suffix_train_episodes=_INSERT_MEMORY_HIL_SUFFIX_TRAIN_EPISODES,
+        success_train_episodes=_INSERT_MEMORY_SUCCESS_TRAIN_EPISODES,
+        val_episodes=_INSERT_MEMORY_VAL_EPISODES,
+    ),
+    _rss_memory_phase2_bc_config(
+        task_slug="insert-mouse-battery",
+        phase2_slug="insert_mouse_battery",
+        checkpoint_subdir="mouse_80k",
+        memory_dim=70,
+        state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
+        state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
+        max_token_len=320,
+        expert_train_episodes=_INSERT_MEMORY_EXPERT_TRAIN_EPISODES,
+        hil_suffix_train_episodes=_INSERT_MEMORY_HIL_SUFFIX_TRAIN_EPISODES,
+        success_train_episodes=_INSERT_MEMORY_SUCCESS_TRAIN_EPISODES,
+        val_episodes=_INSERT_MEMORY_VAL_EPISODES,
+    ),
+    _rss_memory_phase2_bc_config(
+        task_slug="tower-of-hanoi-game",
+        phase2_slug="tower_of_hanoi_game",
+        checkpoint_subdir="hanoi_200k",
+        memory_dim=42,
+        state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+        state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+        max_token_len=240,
+        expert_train_episodes=_TOWER_MEMORY_EXPERT_TRAIN_EPISODES,
+        hil_suffix_train_episodes=_TOWER_MEMORY_HIL_SUFFIX_TRAIN_EPISODES,
+        success_train_episodes=_TOWER_MEMORY_SUCCESS_TRAIN_EPISODES,
+        val_episodes=_TOWER_MEMORY_VAL_EPISODES,
+    ),
+    _rss_memory_phase2_bc_config(
+        task_slug="tower-of-hanoi-game",
+        phase2_slug="tower_of_hanoi_game",
+        checkpoint_subdir="hanoi_200k",
+        memory_dim=70,
+        state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
+        state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
+        max_token_len=320,
+        expert_train_episodes=_TOWER_MEMORY_EXPERT_TRAIN_EPISODES,
+        hil_suffix_train_episodes=_TOWER_MEMORY_HIL_SUFFIX_TRAIN_EPISODES,
+        success_train_episodes=_TOWER_MEMORY_SUCCESS_TRAIN_EPISODES,
+        val_episodes=_TOWER_MEMORY_VAL_EPISODES,
+    ),
+    TrainConfig(
+        name="pi05_rss_multitask_smoke",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=DualYamDataConfig(
+            repo_id="filtered_multitask",
+            base_config=DataConfig(prompt_from_task=True, local_files_path="/inspire/qb-ilm/project/gjjproject/public/xl/data/rss_challenge/filtered_multitask"),
+            assets=AssetsConfig(
+                assets_dir="/inspire/qb-ilm/project/gjjproject/public/xl/data/baseline_checkpoints/pi05_rss2026_multitask/199999/assets/v21",
+                asset_id="rss2026_multitask",
+            ),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/qb-ilm/project/gjjproject/public/xl/data/baseline_checkpoints/pi05_rss2026_multitask/199999/params"),
+        num_train_steps=10,
+        batch_size=2,
+        num_workers=0,
+        save_interval=100,
+        overwrite=True,
+        exp_name="smoke_test",
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_rss_generalist",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=DualYamDataConfig(
+            repo_id="mixed_multitask",
+            base_config=DataConfig(prompt_from_task=True, local_files_path="/inspire/qb-ilm/project/gjjproject/public/xl/data/rss_challenge/mixed_multitask"),
+            assets=AssetsConfig(
+                assets_dir="/inspire/qb-ilm/project/gjjproject/public/xl/data/baseline_checkpoints/pi05_rss2026_multitask/199999/assets/v21",
+                asset_id="rss2026_multitask",
+            ),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/qb-ilm/project/gjjproject/public/xl/data/baseline_checkpoints/pi05_rss2026_multitask/199999/params"),
+        num_train_steps=100_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=20_000,
+    ),
+    TrainConfig(
+        name="pi05_rss_multitask_ft",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=DualYamDataConfig(
+            repo_id="filtered_multitask",
+            base_config=DataConfig(prompt_from_task=True, local_files_path="/inspire/qb-ilm/project/gjjproject/public/xl/data/rss_challenge/filtered_multitask"),
+            assets=AssetsConfig(
+                assets_dir="/inspire/qb-ilm/project/gjjproject/public/xl/data/baseline_checkpoints/pi05_rss2026_multitask/199999/assets/v21",
+                asset_id="rss2026_multitask",
+            ),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/qb-ilm/project/gjjproject/public/xl/data/baseline_checkpoints/pi05_rss2026_multitask/199999/params"),
+        num_train_steps=100_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=20_000,
     ),
     #
     # Inference Aloha configs.
@@ -1014,6 +1852,174 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    TrainConfig(
+        # DROID whiteboard dataset collected in this workspace.
+        #
+        # The current LeRobot export stores 8-D actions that match absolute joint
+        # positions plus gripper, so we convert the 7 joint dimensions to deltas
+        # before training, matching the pi05 full-DROID joint-position path.
+        name="pi05_droid_whiteboard_joint_position_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,  # pi05-DROID checkpoints use 32-D padded state/action tensors.
+            action_horizon=16,
+        ),
+        data=LeRobotDROIDDataConfig(
+            repo_id="lerobot_whiteboard_v1",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path="/inspire/qb-ilm/project/gjjproject/public/xl/data/droid_whiteboard/lerobot_whiteboard_v1",
+            ),
+            assets=AssetsConfig(
+                # Reuse pi05-DROID normalization for compatibility with the base checkpoint.
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-5,
+        ),
+        num_train_steps=20_000,
+        batch_size=32,
+        num_workers=8,
+        log_interval=50,
+        eval_interval=500,
+        num_eval_batches=10,
+        save_interval=2_000,
+        keep_period=10_000,
+    ),
+    TrainConfig(
+        # Low-memory LoRA variant of the joint-position whiteboard fine-tune.
+        name="pi05_droid_whiteboard_joint_position_lora_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotDROIDDataConfig(
+            repo_id="lerobot_whiteboard_v1",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path="/inspire/qb-ilm/project/gjjproject/public/xl/data/droid_whiteboard/lerobot_whiteboard_v1",
+            ),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-5,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=20_000,
+        batch_size=32,
+        num_workers=8,
+        log_interval=50,
+        eval_interval=500,
+        num_eval_batches=10,
+        save_interval=2_000,
+        keep_period=10_000,
+    ),
+    TrainConfig(
+        # Local smoke-test variant: same LoRA/data path as the DROID whiteboard
+        # LoRA fine-tune, but loads an existing local pi05 checkpoint to avoid
+        # downloading official pi05-DROID params during smoke tests.
+        name="pi05_droid_whiteboard_joint_position_lora_local_smoke",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotDROIDDataConfig(
+            repo_id="lerobot_whiteboard_v1",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path="/inspire/qb-ilm/project/gjjproject/public/xl/data/droid_whiteboard/lerobot_whiteboard_v1",
+            ),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/inspire/qb-ilm/project/gjjproject/public/xl/data/baseline_checkpoints/pi05_rss2026_multitask/199999/params"
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=2,
+        batch_size=1,
+        num_workers=0,
+        log_interval=1,
+        eval_interval=0,
+        num_eval_batches=0,
+        save_interval=1,
+        keep_period=10_000,
+        overwrite=True,
+        exp_name="smoke_joint_position_lora",
+        wandb_enabled=False,
+        tensorboard_enabled=False,
+    ),
+    TrainConfig(
+        # True delta-EEF variant for DROID whiteboard. The generated dataset uses
+        # 6-D Cartesian pose state plus gripper state, and 6-D next-step EEF delta
+        # plus gripper action.
+        name="pi05_droid_whiteboard_delta_eef_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotDROIDEefDataConfig(
+            repo_id="lerobot_whiteboard_delta_eef_v1",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path="/inspire/qb-ilm/project/gjjproject/public/xl/data/droid_whiteboard/lerobot_whiteboard_delta_eef_v1",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-5,
+        ),
+        num_train_steps=20_000,
+        batch_size=32,
+        num_workers=8,
+        log_interval=50,
+        eval_interval=500,
+        num_eval_batches=10,
+        save_interval=2_000,
+        keep_period=10_000,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

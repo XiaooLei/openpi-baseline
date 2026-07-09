@@ -47,6 +47,7 @@ class WebsocketPolicyServer:
 
     async def _handler(self, websocket: _server.ServerConnection):
         logger.info(f"Connection from {websocket.remote_address} opened")
+        self._policy.reset()
         packer = msgpack_numpy.Packer()
 
         await websocket.send(packer.pack(self._metadata))

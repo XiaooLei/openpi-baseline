@@ -144,6 +144,109 @@ class YamInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class YamMemoryInputs(transforms.DataTransformFn):
+    """YAM inputs with sparse proprioception deltas.
+
+    Expected inputs are the same as YamInputs, except state is provided as
+    state_history with shape [history, 14]. The current state is kept as the
+    continuous state, and sparse state deltas are emitted as token_state for pi05.
+    """
+
+    action_dim: int
+    adapt_to_pi: bool = True
+    model_type: _model.ModelType = _model.ModelType.PI0
+    current_state_index: int = -1
+
+    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_left_wrist", "cam_right_wrist")
+
+    def __call__(self, data: dict) -> dict:
+        state_history = np.asarray(data["state_history"])
+        state_history = _decode_yam_state(state_history, adapt_to_pi=self.adapt_to_pi)
+        current_state = transforms.pad_to_dim(state_history[self.current_state_index], self.action_dim)
+
+        in_images = data["images"]
+        if set(in_images) - set(self.EXPECTED_CAMERAS):
+            raise ValueError(f"Expected images to contain {self.EXPECTED_CAMERAS}, got {tuple(in_images)}")
+
+        base_image = _convert_yam_image(in_images["cam_high"])
+
+        match self.model_type:
+            case _model.ModelType.PI0 | _model.ModelType.PI05:
+                images = {"base_0_rgb": base_image}
+                image_masks = {"base_0_rgb": np.True_}
+                extra_image_names = {
+                    "left_wrist_0_rgb": "cam_left_wrist",
+                    "right_wrist_0_rgb": "cam_right_wrist",
+                }
+            case _model.ModelType.PI0_FAST:
+                images = {"base_0_rgb": base_image}
+                image_masks = {"base_0_rgb": np.True_}
+                extra_image_names = {
+                    "base_1_rgb": "cam_left_wrist",
+                    "wrist_0_rgb": "cam_right_wrist",
+                }
+            case _:
+                raise ValueError(f"Unsupported model type: {self.model_type}")
+
+        for dest, source in extra_image_names.items():
+            if source in in_images:
+                images[dest] = _convert_yam_image(in_images[source])
+                image_masks[dest] = np.True_
+            else:
+                images[dest] = np.zeros_like(base_image)
+                image_masks[dest] = np.False_
+
+        inputs = {
+            "image": images,
+            "image_mask": image_masks,
+            "state": current_state,
+            "state_history": state_history,
+        }
+
+        if "actions" in data:
+            actions = np.asarray(data["actions"])
+            actions = _encode_yam_actions_inv(actions, adapt_to_pi=self.adapt_to_pi)
+            inputs["actions"] = transforms.pad_to_dim(actions, self.action_dim)
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class SparseYamStateDeltaContext(transforms.DataTransformFn):
+    """Builds pi05 token_state from current state plus sparse proprioceptive deltas."""
+
+    state_history_delta_indices: tuple[int, ...] = (-120, -60, -30, -15, 0)
+    delta_pairs: tuple[tuple[int, int], ...] = ((0, -15), (-15, -30), (-30, -60), (-60, -120))
+
+    def __call__(self, data: dict) -> dict:
+        if "state_history" not in data:
+            return data
+
+        state = np.asarray(data["state"])
+        state_history = np.asarray(data.pop("state_history"))
+
+        offset_to_index = {offset: index for index, offset in enumerate(self.state_history_delta_indices)}
+        current_state = state_history[offset_to_index[0]]
+        deltas = []
+        for newer_offset, older_offset in self.delta_pairs:
+            if newer_offset not in offset_to_index or older_offset not in offset_to_index:
+                raise ValueError(
+                    f"Delta pair {(newer_offset, older_offset)} is not covered by "
+                    f"state_history_delta_indices={self.state_history_delta_indices}."
+                )
+            newer_index = offset_to_index[newer_offset]
+            older_index = offset_to_index[older_offset]
+            deltas.append(state_history[newer_index] - state_history[older_index])
+
+        data["token_state"] = np.concatenate([current_state, *deltas], axis=-1)
+        data["state"] = state
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class YamOutputs(transforms.DataTransformFn):
     """Outputs for the World Engine's Yam policy."""
 
@@ -168,28 +271,31 @@ def _decode_yam(data: dict, *, adapt_to_pi: bool = False) -> dict:
     state = np.asarray(data["state"])
     state = _decode_yam_state(state, adapt_to_pi=adapt_to_pi)
 
-    def convert_image(img):
-        img = np.asarray(img)
-        # Convert to uint8 if using float images.
-        if np.issubdtype(img.dtype, np.floating):
-            img = (255 * img).astype(np.uint8)
-        # Convert from [channel, height, width] to [height, width, channel].
-        return einops.rearrange(img, "c h w -> h w c")
-
     images = data["images"]
-    images_dict = {name: convert_image(img) for name, img in images.items()}
+    images_dict = {name: _convert_yam_image(img) for name, img in images.items()}
 
     data["images"] = images_dict
     data["state"] = state
     return data
 
 
+def _convert_yam_image(img) -> np.ndarray:
+    img = np.asarray(img)
+    # Convert to uint8 if using float images.
+    if np.issubdtype(img.dtype, np.floating):
+        img = (255 * img).astype(np.uint8)
+    # Convert from [channel, height, width] to [height, width, channel].
+    if img.ndim == 3 and img.shape[0] == 3:
+        return einops.rearrange(img, "c h w -> h w c")
+    return img
+
+
 def _decode_yam_state(state: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
     if adapt_to_pi:
         # Flip the joints.
-        state = _yam_joint_flip_mask() * state[: _yam_joint_flip_mask().shape[0]]
+        state = _yam_joint_flip_mask() * state[..., : _yam_joint_flip_mask().shape[0]]
         # Reverse the gripper transformation that is being applied by the Piper runtime.
-        state[[6, 13]] = _gripper_to_angular(state[[6, 13]])
+        state[..., [6, 13]] = _gripper_to_angular(state[..., [6, 13]])
     return state
 
 

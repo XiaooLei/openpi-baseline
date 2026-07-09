@@ -254,8 +254,9 @@ class TokenizePrompt(DataTransformFn):
             raise ValueError("Prompt is required")
 
         if self.discrete_state_input:
-            if (state := data.get("state", None)) is None:
+            if (state := data.get("token_state", data.get("state", None))) is None:
                 raise ValueError("State is required.")
+            data.pop("token_state", None)
         else:
             state = None
 

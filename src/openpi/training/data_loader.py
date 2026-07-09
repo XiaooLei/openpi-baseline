@@ -54,12 +54,94 @@ class TransformedDataset(Dataset[T_co]):
     def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
         self._dataset = dataset
         self._transform = _transforms.compose(transforms)
+        if hasattr(dataset, "source_lengths"):
+            self.source_lengths = dataset.source_lengths
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
         return self._transform(self._dataset[index])
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class EpisodeSubsetDataset(Dataset[T_co]):
+    def __init__(
+        self,
+        dataset: Dataset[T_co],
+        episode_indices: Sequence[int],
+        episode_lengths: dict[int, int],
+        frame_stride: int = 1,
+    ):
+        if frame_stride < 1:
+            raise ValueError(f"frame_stride must be >= 1, got {frame_stride}.")
+        self._dataset = dataset
+        episode_starts = {}
+        cursor = 0
+        for episode_index in sorted(episode_lengths):
+            episode_starts[episode_index] = cursor
+            cursor += episode_lengths[episode_index]
+
+        missing = sorted(set(episode_indices) - set(episode_lengths))
+        if missing:
+            raise ValueError(f"Episode indices not found in dataset metadata: {missing}")
+
+        self._indices = np.concatenate(
+            [
+                np.arange(
+                    episode_starts[episode_index],
+                    episode_starts[episode_index] + episode_lengths[episode_index],
+                    frame_stride,
+                    dtype=np.int64,
+                )
+                for episode_index in episode_indices
+            ]
+        )
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        return self._dataset[int(self._indices[index.__index__()])]
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+
+class SourceWeightedRandomSampler(torch.utils.data.Sampler[int]):
+    """Samples from a concatenated dataset with fixed source-level probabilities."""
+
+    def __init__(self, source_lengths: Sequence[int], source_weights: Sequence[float], *, seed: int):
+        if len(source_lengths) != len(source_weights):
+            raise ValueError(
+                f"source_lengths length ({len(source_lengths)}) must match source_weights length ({len(source_weights)})."
+            )
+        if not source_lengths or any(length <= 0 for length in source_lengths):
+            raise ValueError(f"source_lengths must all be positive, got {source_lengths}.")
+        if any(weight <= 0 for weight in source_weights):
+            raise ValueError(f"source_weights must all be positive, got {source_weights}.")
+
+        self._source_lengths = tuple(int(length) for length in source_lengths)
+        self._source_weights = torch.as_tensor(source_weights, dtype=torch.double)
+        self._source_weights = self._source_weights / self._source_weights.sum()
+        self._source_offsets = tuple(np.cumsum((0, *self._source_lengths[:-1])).tolist())
+        self._num_samples = sum(self._source_lengths)
+        self._seed = seed
+        self._epoch = 0
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self._seed + self._epoch)
+        self._epoch += 1
+
+        source_indices = torch.multinomial(
+            self._source_weights,
+            self._num_samples,
+            replacement=True,
+            generator=generator,
+        )
+        for source_index in source_indices.tolist():
+            local_index = int(torch.randint(self._source_lengths[source_index], (), generator=generator))
+            yield self._source_offsets[source_index] + local_index
+
+    def __len__(self) -> int:
+        return self._num_samples
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -127,29 +209,75 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _create_single_lerobot_dataset(data_config: _config.DataConfig, action_horizon: int) -> Dataset:
+    repo_id = data_config.repo_id
+    if repo_id is None:
+        raise ValueError("Repo ID is not set. Cannot create dataset.")
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.local_files_path)
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+    for key, delta_indices in data_config.observation_delta_indices.items():
+        delta_timestamps[key] = [t / dataset_meta.fps for t in delta_indices]
+
+    dataset = lerobot_dataset.LeRobotDataset(
+        data_config.repo_id,
+        delta_timestamps=delta_timestamps,
+        root=data_config.local_files_path,
+        video_backend=data_config.video_backend,
+    )
+    if data_config.frame_stride < 1:
+        raise ValueError(f"frame_stride must be >= 1, got {data_config.frame_stride}.")
+    if data_config.episodes is not None:
+        episode_lengths = {
+            int(episode_index): int(episode["length"]) for episode_index, episode in dataset_meta.episodes.items()
+        }
+        dataset = EpisodeSubsetDataset(dataset, data_config.episodes, episode_lengths, data_config.frame_stride)
+        logging.info(
+            "Using %d selected episodes with %d frame anchors (frame_stride=%d).",
+            len(data_config.episodes),
+            len(dataset),
+            data_config.frame_stride,
+        )
+    elif data_config.frame_stride > 1:
+        episode_lengths = {
+            int(episode_index): int(episode["length"]) for episode_index, episode in dataset_meta.episodes.items()
+        }
+        dataset = EpisodeSubsetDataset(dataset, sorted(episode_lengths), episode_lengths, data_config.frame_stride)
+        logging.info("Using all episodes with %d frame anchors (frame_stride=%d).", len(dataset), data_config.frame_stride)
+
+    if data_config.prompt_from_task:
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    return dataset
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
     """Create a dataset for training."""
+    if data_config.source_configs:
+        source_datasets = [
+            _create_single_lerobot_dataset(typing.cast(_config.DataConfig, source_config), action_horizon)
+            for source_config in data_config.source_configs
+        ]
+        dataset = torch.utils.data.ConcatDataset(typing.cast(Sequence[torch.utils.data.Dataset], source_datasets))
+        dataset.source_lengths = tuple(len(source_dataset) for source_dataset in source_datasets)
+        logging.info(
+            "Using mixed LeRobot dataset with source lengths=%s and source weights=%s.",
+            dataset.source_lengths,
+            data_config.source_weights,
+        )
+        return dataset
+
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.local_files_path)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-        root=data_config.local_files_path
-    )
-
-    if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
-
-    return dataset
+    return _create_single_lerobot_dataset(data_config, action_horizon)
 
 
 def create_rlds_dataset(
@@ -229,6 +357,8 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    data_config_factory: _config.DataConfigFactory | None = None,
+    num_workers: int | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -239,8 +369,10 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+        data_config_factory: Optional data config factory override, used for held-out eval data.
+        num_workers: Optional worker count override for torch data loading.
     """
-    data_config = config.data.create(config.assets_dirs, config.model)
+    data_config = (data_config_factory or config.data).create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
@@ -262,7 +394,7 @@ def create_data_loader(
         sharding=sharding,
         shuffle=shuffle,
         num_batches=num_batches,
-        num_workers=config.num_workers,
+        num_workers=config.num_workers if num_workers is None else num_workers,
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
@@ -321,6 +453,12 @@ def create_torch_data_loader(
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
+        if data_config.source_weights and shuffle:
+            source_lengths = getattr(dataset, "source_lengths", None)
+            if source_lengths is None:
+                raise ValueError("source_weights were provided but the dataset does not expose source_lengths.")
+            sampler = SourceWeightedRandomSampler(source_lengths, data_config.source_weights, seed=seed)
+            shuffle = False
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(

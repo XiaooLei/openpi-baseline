@@ -13,6 +13,7 @@ import jax.experimental
 import jax.numpy as jnp
 import numpy as np
 import optax
+from torch.utils.tensorboard import SummaryWriter
 import tqdm_loggable.auto as tqdm
 import wandb
 
@@ -134,6 +135,68 @@ def init_train_state(
 
 
 @at.typecheck
+def eval_step(
+    model_def: nnx.GraphDef,
+    params: at.Params,
+    rng: at.KeyArrayLike,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> dict[str, at.Array]:
+    model = nnx.merge(model_def, params)
+    model.eval()
+    observation, expert_actions = batch
+
+    pred_actions = model.sample_actions(rng, observation)
+    err = pred_actions - expert_actions
+    abs_err = jnp.abs(err)
+    sq_err = jnp.square(err)
+    mae = jnp.mean(abs_err)
+    rmse = jnp.sqrt(jnp.mean(sq_err))
+
+    # YAM has 14 real action dimensions and pads to the model action dim. Keep this metric from being diluted by padding.
+    action_dims = min(14, expert_actions.shape[-1])
+    mae_action_dims = jnp.mean(abs_err[..., :action_dims])
+    rmse_action_dims = jnp.sqrt(jnp.mean(sq_err[..., :action_dims]))
+
+    # Per-action-dimension metrics averaged over batch and horizon.
+    mae_per_dim = jnp.mean(abs_err, axis=(0, 1))
+    rmse_per_dim = jnp.sqrt(jnp.mean(sq_err, axis=(0, 1)))
+
+    return {
+        "eval/mae": mae,
+        "eval/mae_action_dims": mae_action_dims,
+        "eval/rmse": rmse,
+        "eval/rmse_action_dims": rmse_action_dims,
+        "eval/mae_per_dim": mae_per_dim,
+        "eval/rmse_per_dim": rmse_per_dim,
+    }
+
+
+def flatten_metrics(metrics: dict[str, Any]) -> dict[str, float]:
+    """Convert scalar and vector metrics to scalar-only values for logging backends."""
+    flat = {}
+    for key, value in metrics.items():
+        array = np.asarray(value)
+        if array.ndim == 0:
+            flat[key] = float(array)
+            continue
+        for index in np.ndindex(array.shape):
+            suffix = "_".join(f"{i:02d}" for i in index)
+            flat[f"{key}_{suffix}"] = float(array[index])
+    return flat
+
+
+def prefix_eval_metrics(metrics: dict[str, float], prefix: str) -> dict[str, float]:
+    """Rename eval metrics to a split-specific prefix."""
+    renamed = {}
+    for key, value in metrics.items():
+        if key.startswith("eval/"):
+            renamed[f"eval/{prefix}_{key.removeprefix('eval/')}"] = value
+        else:
+            renamed[f"eval/{prefix}_{key}"] = value
+    return renamed
+
+
+@at.typecheck
 def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
@@ -216,6 +279,7 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    tb_writer = SummaryWriter(log_dir=config.checkpoint_dir / "tensorboard") if config.tensorboard_enabled else None
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -225,6 +289,26 @@ def main(config: _config.TrainConfig):
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+
+    heldout_eval_data_loader = None
+    if config.eval_interval > 0 and config.num_eval_batches > 0:
+        heldout_eval_data_loader = _data_loader.create_data_loader(
+            config,
+            sharding=data_sharding,
+            shuffle=config.eval_data is not None,
+            num_batches=config.num_eval_batches,
+            data_config_factory=config.eval_data,
+            num_workers=min(config.num_workers, 8),
+        )
+    heldin_eval_data_loader = None
+    if config.eval_interval > 0 and config.num_heldin_eval_batches > 0:
+        heldin_eval_data_loader = _data_loader.create_data_loader(
+            config,
+            sharding=data_sharding,
+            shuffle=True,
+            num_batches=config.num_heldin_eval_batches,
+            num_workers=min(config.num_workers, 8),
+        )
 
     # Log images from first batch to sanity check.
     images_to_log = [
@@ -247,6 +331,12 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
+    peval_step = jax.jit(
+        eval_step,
+        in_shardings=(replicated_sharding, train_state_sharding.params, replicated_sharding, data_sharding),
+        out_shardings=replicated_sharding,
+    )
+
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
@@ -255,25 +345,69 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
-    infos = []
-    for step in pbar:
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
-        if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
-        batch = next(data_iter)
+    try:
+        infos = []
+        for step in pbar:
+            with sharding.set_mesh(mesh):
+                train_state, info = ptrain_step(train_rng, train_state, batch)
+            infos.append(info)
+            if step % config.log_interval == 0:
+                stacked_infos = common_utils.stack_forest(infos)
+                reduced_info = flatten_metrics(jax.device_get(jax.tree.map(lambda x: jnp.mean(x, axis=0), stacked_infos)))
+                info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                pbar.write(f"Step {step}: {info_str}")
+                wandb.log(reduced_info, step=step)
+                if tb_writer is not None:
+                    for k, v in reduced_info.items():
+                        tb_writer.add_scalar(k, v, step)
+                infos = []
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            if step % config.eval_interval == 0 and step > start_step:
+                try:
+                    all_eval_metrics = {}
+                    for split_name, eval_data_loader, rng_fold, include_legacy in (
+                        ("heldout", heldout_eval_data_loader, 0, True),
+                        ("heldin", heldin_eval_data_loader, 1, False),
+                    ):
+                        if eval_data_loader is None:
+                            continue
+                        eval_infos = []
+                        eval_rng = jax.random.fold_in(train_rng, rng_fold)
+                        for eval_batch in eval_data_loader:
+                            eval_rng, batch_rng = jax.random.split(eval_rng)
+                            with sharding.set_mesh(mesh):
+                                eval_info = peval_step(
+                                    train_state.model_def, train_state.params, batch_rng, eval_batch
+                                )
+                            eval_infos.append(eval_info)
+                        stacked_eval = common_utils.stack_forest(eval_infos)
+                        reduced_eval = flatten_metrics(
+                            jax.device_get(jax.tree.map(lambda x: jnp.mean(x, axis=0), stacked_eval))
+                        )
+                        split_metrics = prefix_eval_metrics(reduced_eval, split_name)
+                        if include_legacy:
+                            split_metrics = {**reduced_eval, **split_metrics}
+                        all_eval_metrics.update(split_metrics)
 
-    logging.info("Waiting for checkpoint manager to finish")
-    checkpoint_manager.wait_until_finished()
+                    if all_eval_metrics:
+                        eval_str = ", ".join(f"{k}={v:.4f}" for k, v in all_eval_metrics.items())
+                        pbar.write(f"Step {step} eval: {eval_str}")
+                        wandb.log(all_eval_metrics, step=step)
+                        if tb_writer is not None:
+                            for k, v in all_eval_metrics.items():
+                                tb_writer.add_scalar(k, v, step)
+                except Exception:
+                    logging.exception("Eval at step %s failed", step)
+            batch = next(data_iter)
+
+            if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+
+        logging.info("Waiting for checkpoint manager to finish")
+        checkpoint_manager.wait_until_finished()
+    finally:
+        if tb_writer is not None:
+            tb_writer.close()
 
 
 if __name__ == "__main__":
