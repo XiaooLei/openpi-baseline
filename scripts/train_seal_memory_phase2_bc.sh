@@ -38,6 +38,7 @@ export WANDB_MODE=${WANDB_MODE:-offline}
 export RSS_DATA_ROOT
 export RSS_BASELINE_CHECKPOINT_ROOT
 export RSS_SECOND_SUBMIT_CHECKPOINT_ROOT
+export PYTHONPATH="$PWD/src:$PWD/packages/openpi-client/src${PYTHONPATH:+:$PYTHONPATH}"
 
 TOKENIZER_PATH="$OPENPI_DATA_HOME/big_vision/paligemma_tokenizer.model"
 CHECKPOINT_PATH="$SEAL_PHASE2_CHECKPOINT_DIR/params"
