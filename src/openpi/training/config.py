@@ -819,8 +819,8 @@ _SEAL_MEMORY_SUCCESS_TRAIN_EPISODES = tuple(
 )
 _SEAL_MEMORY70_HISTORY_INDICES = (-120, -60, -30, -15, 0)
 _SEAL_MEMORY70_DELTA_PAIRS = ((0, -15), (-15, -30), (-30, -60), (-60, -120))
-_SEAL_MEMORY42_HISTORY_INDICES = (-120, -30, 0)
-_SEAL_MEMORY42_DELTA_PAIRS = ((0, -30), (0, -120))
+_SEAL_MEMORY42_HISTORY_INDICES = (-120, -60, 0)
+_SEAL_MEMORY42_DELTA_PAIRS = ((0, -60), (0, -120))
 _RSS_DATA_ROOT = os.environ.get(
     "RSS_DATA_ROOT",
     "/inspire/qb-ilm/project/gjjproject/public/xl/data/rss_challenge",
@@ -838,6 +838,9 @@ _SEAL_MIXED_DATA_PATH = f"{_RSS_RAW_DATA_ROOT}/seal-water-bottle-cap/expert-succ
 _SEAL_PHASE2_TRAIN_PATH = f"{_RSS_PHASE2_RECAP_ROOT}/seal_water_bottle_cap_hil_split/train"
 _SEAL_BASELINE_CHECKPOINT_DIR = f"{_RSS_BASELINE_CHECKPOINT_ROOT}/pi05_seal-water-bottle-cap/199999"
 _SEAL_BASELINE_ASSETS_DIR = f"{_SEAL_BASELINE_CHECKPOINT_DIR}/assets/v21"
+_SEAL_WATER120_CHECKPOINT_DIR = f"{_RSS_SECOND_SUBMIT_CHECKPOINT_ROOT}/water_120k"
+_SEAL_WATER120_ASSETS_DIR = f"{_SEAL_WATER120_CHECKPOINT_DIR}/assets"
+_SEAL_WATER120_ASSET_ID = "seal-water-bottle-cap/expert-success-hil-suffix-mix-data"
 _INSERT_MEMORY_TOTAL_EPISODES = 1231
 _INSERT_MEMORY_VAL_EPISODES = (24, 120, 240, 360, 527, 720, 830, 860, 940, 1086, 1100, 1220)
 _INSERT_MEMORY_EXPERT_TRAIN_EPISODES = tuple(
@@ -1166,8 +1169,8 @@ _CONFIGS = [
                         frame_stride=2,
                     ),
                     assets=AssetsConfig(
-                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
-                        asset_id="seal-water-bottle-cap",
+                        assets_dir=_SEAL_WATER120_ASSETS_DIR,
+                        asset_id=_SEAL_WATER120_ASSET_ID,
                     ),
                     state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
                     state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
@@ -1182,8 +1185,8 @@ _CONFIGS = [
                         episodes=_SEAL_MEMORY_HIL_SUFFIX_TRAIN_EPISODES,
                     ),
                     assets=AssetsConfig(
-                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
-                        asset_id="seal-water-bottle-cap",
+                        assets_dir=_SEAL_WATER120_ASSETS_DIR,
+                        asset_id=_SEAL_WATER120_ASSET_ID,
                     ),
                     state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
                     state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
@@ -1198,8 +1201,8 @@ _CONFIGS = [
                         episodes=_SEAL_MEMORY_SUCCESS_TRAIN_EPISODES,
                     ),
                     assets=AssetsConfig(
-                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
-                        asset_id="seal-water-bottle-cap",
+                        assets_dir=_SEAL_WATER120_ASSETS_DIR,
+                        asset_id=_SEAL_WATER120_ASSET_ID,
                     ),
                     state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
                     state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
@@ -1214,8 +1217,8 @@ _CONFIGS = [
                         episodes=_SEAL_PHASE2_QUALITY60_EPISODES,
                     ),
                     assets=AssetsConfig(
-                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
-                        asset_id="seal-water-bottle-cap",
+                        assets_dir=_SEAL_WATER120_ASSETS_DIR,
+                        asset_id=_SEAL_WATER120_ASSET_ID,
                     ),
                     state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
                     state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
@@ -1232,15 +1235,15 @@ _CONFIGS = [
                 episodes=_SEAL_MEMORY_VAL_EPISODES,
             ),
             assets=AssetsConfig(
-                assets_dir=_SEAL_BASELINE_ASSETS_DIR,
-                asset_id="seal-water-bottle-cap",
+                assets_dir=_SEAL_WATER120_ASSETS_DIR,
+                asset_id=_SEAL_WATER120_ASSET_ID,
             ),
             state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
             state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
             use_delta_joint_actions=True,
             adapt_to_pi=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_SEAL_BASELINE_CHECKPOINT_DIR}/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_SEAL_WATER120_CHECKPOINT_DIR}/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=2_000,
             peak_lr=2e-5,
@@ -1275,8 +1278,8 @@ _CONFIGS = [
                         frame_stride=2,
                     ),
                     assets=AssetsConfig(
-                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
-                        asset_id="seal-water-bottle-cap",
+                        assets_dir=_SEAL_WATER120_ASSETS_DIR,
+                        asset_id=_SEAL_WATER120_ASSET_ID,
                     ),
                     state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
                     state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
@@ -1291,8 +1294,8 @@ _CONFIGS = [
                         episodes=_SEAL_MEMORY_HIL_SUFFIX_TRAIN_EPISODES,
                     ),
                     assets=AssetsConfig(
-                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
-                        asset_id="seal-water-bottle-cap",
+                        assets_dir=_SEAL_WATER120_ASSETS_DIR,
+                        asset_id=_SEAL_WATER120_ASSET_ID,
                     ),
                     state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
                     state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
@@ -1307,8 +1310,8 @@ _CONFIGS = [
                         episodes=_SEAL_MEMORY_SUCCESS_TRAIN_EPISODES,
                     ),
                     assets=AssetsConfig(
-                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
-                        asset_id="seal-water-bottle-cap",
+                        assets_dir=_SEAL_WATER120_ASSETS_DIR,
+                        asset_id=_SEAL_WATER120_ASSET_ID,
                     ),
                     state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
                     state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
@@ -1323,8 +1326,8 @@ _CONFIGS = [
                         episodes=_SEAL_PHASE2_QUALITY60_EPISODES,
                     ),
                     assets=AssetsConfig(
-                        assets_dir=_SEAL_BASELINE_ASSETS_DIR,
-                        asset_id="seal-water-bottle-cap",
+                        assets_dir=_SEAL_WATER120_ASSETS_DIR,
+                        asset_id=_SEAL_WATER120_ASSET_ID,
                     ),
                     state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
                     state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
@@ -1341,15 +1344,15 @@ _CONFIGS = [
                 episodes=_SEAL_MEMORY_VAL_EPISODES,
             ),
             assets=AssetsConfig(
-                assets_dir=_SEAL_BASELINE_ASSETS_DIR,
-                asset_id="seal-water-bottle-cap",
+                assets_dir=_SEAL_WATER120_ASSETS_DIR,
+                asset_id=_SEAL_WATER120_ASSET_ID,
             ),
             state_history_delta_indices=_SEAL_MEMORY70_HISTORY_INDICES,
             state_delta_pairs=_SEAL_MEMORY70_DELTA_PAIRS,
             use_delta_joint_actions=True,
             adapt_to_pi=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_SEAL_BASELINE_CHECKPOINT_DIR}/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_SEAL_WATER120_CHECKPOINT_DIR}/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=2_000,
             peak_lr=2e-5,

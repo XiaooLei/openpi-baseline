@@ -4,10 +4,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CONFIG=${CONFIG:-pi05_seal-water-bottle-cap_memory42_phase2_bc}
-EXP_NAME=${EXP_NAME:-seal_memory42_phase2_q60_stride_bc}
+EXP_NAME=${EXP_NAME:-seal_memory42_60_120_water120_phase2_bc}
 RSS_DATA_ROOT=${RSS_DATA_ROOT:-/inspire/qb-ilm/project/gjjproject/public/xl/data/rss_challenge}
 RSS_BASELINE_CHECKPOINT_ROOT=${RSS_BASELINE_CHECKPOINT_ROOT:-/inspire/qb-ilm/project/gjjproject/public/xl/data/baseline_checkpoints}
 RSS_SECOND_SUBMIT_CHECKPOINT_ROOT=${RSS_SECOND_SUBMIT_CHECKPOINT_ROOT:-$RSS_BASELINE_CHECKPOINT_ROOT/2nd-submit}
+SEAL_PHASE2_CHECKPOINT_DIR=${SEAL_PHASE2_CHECKPOINT_DIR:-$RSS_SECOND_SUBMIT_CHECKPOINT_ROOT/water_120k}
 
 FSDP_DEVICES=${FSDP_DEVICES:-auto}
 BATCH_SIZE=${BATCH_SIZE:-32}
@@ -30,8 +31,8 @@ export RSS_BASELINE_CHECKPOINT_ROOT
 export RSS_SECOND_SUBMIT_CHECKPOINT_ROOT
 
 TOKENIZER_PATH="$OPENPI_DATA_HOME/big_vision/paligemma_tokenizer.model"
-CHECKPOINT_PATH="$RSS_BASELINE_CHECKPOINT_ROOT/pi05_seal-water-bottle-cap/199999/params"
-NORM_STATS_PATH="$RSS_BASELINE_CHECKPOINT_ROOT/pi05_seal-water-bottle-cap/199999/assets/v21/seal-water-bottle-cap/norm_stats.json"
+CHECKPOINT_PATH="$SEAL_PHASE2_CHECKPOINT_DIR/params"
+NORM_STATS_PATH="$SEAL_PHASE2_CHECKPOINT_DIR/assets/seal-water-bottle-cap/expert-success-hil-suffix-mix-data/norm_stats.json"
 EXPERT_DATASET_PATH="$RSS_DATA_ROOT/raw/seal-water-bottle-cap/expert-success-hil-suffix-mix-data/meta/info.json"
 PHASE2_DATASET_PATH="$RSS_DATA_ROOT/recap/phase2/seal_water_bottle_cap_hil_split/train/meta/info.json"
 PHASE2_ADVANTAGE_PATH="$RSS_DATA_ROOT/recap/phase2/seal_water_bottle_cap_hil_split/train/meta/advantages_seal-water-bottle-cap.parquet"
