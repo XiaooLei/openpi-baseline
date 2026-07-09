@@ -9,8 +9,17 @@ TASK_SLUG=${TASK_SLUG:?TASK_SLUG must be set by a task wrapper}
 PHASE2_SLUG=${PHASE2_SLUG:?PHASE2_SLUG must be set by a task wrapper}
 CHECKPOINT_EXTRACT_DIR=${CHECKPOINT_EXTRACT_DIR:?CHECKPOINT_EXTRACT_DIR must be set by a task wrapper}
 CHECKPOINT_TAR=${CHECKPOINT_TAR:-}
-RSS_DATA_ROOT=${RSS_DATA_ROOT:-/inspire/qb-ilm/project/gjjproject/public/xl/data/rss_challenge}
-RSS_BASELINE_CHECKPOINT_ROOT=${RSS_BASELINE_CHECKPOINT_ROOT:-/inspire/qb-ilm/project/gjjproject/public/xl/data/baseline_checkpoints}
+LOCAL_DATA_ROOT="$(dirname "$PWD")/data"
+DEFAULT_RSS_DATA_ROOT="$LOCAL_DATA_ROOT/rss_challenge"
+DEFAULT_RSS_BASELINE_CHECKPOINT_ROOT="$LOCAL_DATA_ROOT/baseline_checkpoints"
+if [[ ! -e "$DEFAULT_RSS_DATA_ROOT" ]]; then
+  DEFAULT_RSS_DATA_ROOT=/inspire/qb-ilm/project/gjjproject/public/xl/data/rss_challenge
+fi
+if [[ ! -e "$DEFAULT_RSS_BASELINE_CHECKPOINT_ROOT" ]]; then
+  DEFAULT_RSS_BASELINE_CHECKPOINT_ROOT=/inspire/qb-ilm/project/gjjproject/public/xl/data/baseline_checkpoints
+fi
+RSS_DATA_ROOT=${RSS_DATA_ROOT:-$DEFAULT_RSS_DATA_ROOT}
+RSS_BASELINE_CHECKPOINT_ROOT=${RSS_BASELINE_CHECKPOINT_ROOT:-$DEFAULT_RSS_BASELINE_CHECKPOINT_ROOT}
 RSS_SECOND_SUBMIT_CHECKPOINT_ROOT=${RSS_SECOND_SUBMIT_CHECKPOINT_ROOT:-$RSS_BASELINE_CHECKPOINT_ROOT/2nd-submit}
 
 FSDP_DEVICES=${FSDP_DEVICES:-auto}
