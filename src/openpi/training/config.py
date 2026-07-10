@@ -955,6 +955,7 @@ _TOWER_MEMORY_VAL_EPISODES = (
     1580,
     1651,
 )
+_TOWER_MEMORY_EXPERT_VAL_EPISODES = tuple(ep for ep in _TOWER_MEMORY_VAL_EPISODES if ep < 1004)
 _TOWER_MEMORY_EXPERT_TRAIN_EPISODES = tuple(
     ep for ep in range(0, 1004) if ep not in _TOWER_MEMORY_VAL_EPISODES
 )
@@ -2342,6 +2343,41 @@ _CONFIGS.append(
     dataclasses.replace(
         _SEAL_MEMORY70_PHASE2_CONFIG,
         name="pi05_seal-water-bottle-cap_memory70_phase2_bc_lr5e6",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-6,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+        num_train_steps=50_000,
+        num_eval_batches=30,
+        num_heldin_eval_batches=10,
+        keep_period=5_000,
+    )
+)
+
+_TOWER_MEMORY42_PHASE2_CONFIG = next(
+    config for config in _CONFIGS if config.name == "pi05_tower-of-hanoi-game_memory42_phase2_bc"
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        _TOWER_MEMORY42_PHASE2_CONFIG,
+        name="pi05_tower-of-hanoi-game_memory42_phase2_bc_lr5e6",
+        eval_data=_rss_memory_source_config(
+            task_slug="tower-of-hanoi-game",
+            checkpoint_subdir="hanoi_200k",
+            episodes=_TOWER_MEMORY_EXPERT_VAL_EPISODES,
+            state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+            state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+        ),
+        heldin_eval_data=_rss_memory_source_config(
+            task_slug="tower-of-hanoi-game",
+            checkpoint_subdir="hanoi_200k",
+            episodes=_TOWER_MEMORY_EXPERT_TRAIN_EPISODES,
+            frame_stride=2,
+            state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+            state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+        ),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-6,
