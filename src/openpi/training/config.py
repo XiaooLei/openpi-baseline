@@ -268,6 +268,14 @@ class MixtureDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class EvalDataConfig:
+    name: str
+    data: DataConfigFactory
+    num_batches: int | None = None
+    shuffle: bool = True
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotAlohaDataConfig(DataConfigFactory):
     # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
     # Gripper dimensions will remain in absolute values.
@@ -812,6 +820,8 @@ class TrainConfig:
     eval_data: tyro.conf.Suppress[DataConfigFactory | None] = None
     # Optional held-in data used only for action-MAE eval. If omitted, held-in eval uses the training data config.
     heldin_eval_data: tyro.conf.Suppress[DataConfigFactory | None] = None
+    # Optional additional eval data loaders. Metrics are logged as eval/{name}_mae/rmse.
+    extra_eval_data: tyro.conf.Suppress[Sequence[EvalDataConfig]] = ()
 
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
@@ -926,8 +936,18 @@ _SEAL_BASELINE_ASSETS_DIR = f"{_SEAL_BASELINE_CHECKPOINT_DIR}/assets/v21"
 _SEAL_WATER120_CHECKPOINT_DIR = f"{_RSS_SECOND_SUBMIT_CHECKPOINT_ROOT}/water_120k"
 _SEAL_WATER120_ASSETS_DIR = f"{_SEAL_WATER120_CHECKPOINT_DIR}/assets"
 _SEAL_WATER120_ASSET_ID = "seal-water-bottle-cap/expert-success-hil-suffix-mix-data"
+_RSS_GENERALIST_CHECKPOINT_DIR = os.environ.get(
+    "RSS_GENERALIST_CHECKPOINT_DIR",
+    "/inspire/qb-ilm/project/gjjproject/public/xl/rss-challenge/checkpoints/pi05_rss_generalist_450000/jax/450000",
+)
+_RSS_GENERALIST_ASSETS_DIR = os.environ.get(
+    "RSS_GENERALIST_ASSETS_DIR",
+    f"{_RSS_GENERALIST_CHECKPOINT_DIR}/assets",
+)
+_RSS_GENERALIST_ASSET_ID = "rss2026_multitask"
 _INSERT_MEMORY_TOTAL_EPISODES = 1231
 _INSERT_MEMORY_VAL_EPISODES = (24, 120, 240, 360, 527, 720, 830, 860, 940, 1086, 1100, 1220)
+_INSERT_MEMORY_EXPERT_VAL_EPISODES = tuple(ep for ep in _INSERT_MEMORY_VAL_EPISODES if ep < 831)
 _INSERT_MEMORY_EXPERT_TRAIN_EPISODES = tuple(
     ep for ep in range(0, 831) if ep not in _INSERT_MEMORY_VAL_EPISODES
 )
@@ -1090,6 +1110,68 @@ def _rss_nomem_source_config(
             frame_stride=frame_stride,
         ),
         assets=_rss_second_submit_assets(task_slug, checkpoint_subdir),
+        use_delta_joint_actions=True,
+        adapt_to_pi=True,
+    )
+
+
+def _rss_nomem_phase2_source_config(
+    *,
+    task_slug: str,
+    phase2_slug: str,
+    checkpoint_subdir: str,
+) -> DualYamDataConfig:
+    return DualYamDataConfig(
+        repo_id=f"{phase2_slug}_hil_split/train",
+        base_config=DataConfig(
+            prompt_from_task=True,
+            local_files_path=f"{_RSS_PHASE2_RECAP_ROOT}/{phase2_slug}_hil_split/train",
+        ),
+        assets=_rss_second_submit_assets(task_slug, checkpoint_subdir),
+        use_delta_joint_actions=True,
+        adapt_to_pi=True,
+    )
+
+
+def _rss_generalist_assets() -> AssetsConfig:
+    return AssetsConfig(
+        assets_dir=_RSS_GENERALIST_ASSETS_DIR,
+        asset_id=_RSS_GENERALIST_ASSET_ID,
+    )
+
+
+def _rss_generalist_source_config(
+    *,
+    task_slug: str,
+    episodes: Sequence[int] | None,
+    frame_stride: int = 1,
+) -> DualYamDataConfig:
+    return DualYamDataConfig(
+        repo_id=f"{task_slug}/expert-success-hil-suffix-mix-data",
+        base_config=DataConfig(
+            prompt_from_task=True,
+            local_files_path=f"{_RSS_RAW_DATA_ROOT}/{task_slug}/expert-success-hil-suffix-mix-data",
+            episodes=episodes,
+            frame_stride=frame_stride,
+        ),
+        assets=_rss_generalist_assets(),
+        use_delta_joint_actions=True,
+        adapt_to_pi=True,
+    )
+
+
+def _rss_generalist_phase2_source_config(
+    *,
+    task_slug: str,
+    phase2_slug: str,
+) -> DualYamDataConfig:
+    return DualYamDataConfig(
+        repo_id=f"{phase2_slug}_hil_split/train",
+        base_config=DataConfig(
+            prompt_from_task=True,
+            local_files_path=f"{_RSS_PHASE2_RECAP_ROOT}/{phase2_slug}_hil_split/train",
+        ),
+        assets=_rss_generalist_assets(),
         use_delta_joint_actions=True,
         adapt_to_pi=True,
     )
@@ -1899,7 +1981,7 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=20_000,
+        num_train_steps=50_000,
     ),
     TrainConfig(
         name="pi05_aloha_pen_uncap",
@@ -2245,6 +2327,160 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
 ]
 
+_CONFIGS.append(
+    TrainConfig(
+        name="pi05_rss_generalist_phase2_bc_lr5e6",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=MixtureDataConfig(
+            repo_id="rss2026_generalist_phase2_bc",
+            source_weights=(0.2334, 0.2333, 0.2333, 0.10, 0.10, 0.10),
+            data_configs=(
+                _rss_generalist_source_config(
+                    task_slug="insert-mouse-battery",
+                    episodes=_INSERT_MEMORY_EXPERT_TRAIN_EPISODES
+                    + _INSERT_MEMORY_HIL_SUFFIX_TRAIN_EPISODES
+                    + _INSERT_MEMORY_SUCCESS_TRAIN_EPISODES,
+                    frame_stride=2,
+                ),
+                _rss_generalist_source_config(
+                    task_slug="seal-water-bottle-cap",
+                    episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES
+                    + _SEAL_MEMORY_HIL_SUFFIX_TRAIN_EPISODES
+                    + _SEAL_MEMORY_SUCCESS_TRAIN_EPISODES,
+                    frame_stride=2,
+                ),
+                _rss_generalist_source_config(
+                    task_slug="tower-of-hanoi-game",
+                    episodes=_TOWER_MEMORY_EXPERT_TRAIN_EPISODES
+                    + _TOWER_MEMORY_HIL_SUFFIX_TRAIN_EPISODES
+                    + _TOWER_MEMORY_SUCCESS_TRAIN_EPISODES,
+                    frame_stride=2,
+                ),
+                _rss_generalist_phase2_source_config(
+                    task_slug="insert-mouse-battery",
+                    phase2_slug="insert_mouse_battery",
+                ),
+                _rss_generalist_phase2_source_config(
+                    task_slug="seal-water-bottle-cap",
+                    phase2_slug="seal_water_bottle_cap",
+                ),
+                _rss_generalist_phase2_source_config(
+                    task_slug="tower-of-hanoi-game",
+                    phase2_slug="tower_of_hanoi_game",
+                ),
+            ),
+        ),
+        eval_data=MixtureDataConfig(
+            repo_id="rss2026_generalist_expert_heldout",
+            source_weights=(1.0, 1.0, 1.0),
+            data_configs=(
+                _rss_generalist_source_config(
+                    task_slug="insert-mouse-battery",
+                    episodes=_INSERT_MEMORY_EXPERT_VAL_EPISODES,
+                ),
+                _rss_generalist_source_config(
+                    task_slug="seal-water-bottle-cap",
+                    episodes=_SEAL_MEMORY_EXPERT_VAL_EPISODES,
+                ),
+                _rss_generalist_source_config(
+                    task_slug="tower-of-hanoi-game",
+                    episodes=_TOWER_MEMORY_EXPERT_VAL_EPISODES,
+                ),
+            ),
+        ),
+        heldin_eval_data=MixtureDataConfig(
+            repo_id="rss2026_generalist_expert_heldin",
+            source_weights=(1.0, 1.0, 1.0),
+            data_configs=(
+                _rss_generalist_source_config(
+                    task_slug="insert-mouse-battery",
+                    episodes=_INSERT_MEMORY_EXPERT_TRAIN_EPISODES,
+                    frame_stride=4,
+                ),
+                _rss_generalist_source_config(
+                    task_slug="seal-water-bottle-cap",
+                    episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES,
+                    frame_stride=4,
+                ),
+                _rss_generalist_source_config(
+                    task_slug="tower-of-hanoi-game",
+                    episodes=_TOWER_MEMORY_EXPERT_TRAIN_EPISODES,
+                    frame_stride=4,
+                ),
+            ),
+        ),
+        extra_eval_data=(
+            EvalDataConfig(
+                "insert/heldout",
+                _rss_generalist_source_config(
+                    task_slug="insert-mouse-battery",
+                    episodes=_INSERT_MEMORY_EXPERT_VAL_EPISODES,
+                ),
+                num_batches=10,
+            ),
+            EvalDataConfig(
+                "seal/heldout",
+                _rss_generalist_source_config(
+                    task_slug="seal-water-bottle-cap",
+                    episodes=_SEAL_MEMORY_EXPERT_VAL_EPISODES,
+                ),
+                num_batches=10,
+            ),
+            EvalDataConfig(
+                "hanoi/heldout",
+                _rss_generalist_source_config(
+                    task_slug="tower-of-hanoi-game",
+                    episodes=_TOWER_MEMORY_EXPERT_VAL_EPISODES,
+                ),
+                num_batches=10,
+            ),
+            EvalDataConfig(
+                "insert/heldin",
+                _rss_generalist_source_config(
+                    task_slug="insert-mouse-battery",
+                    episodes=_INSERT_MEMORY_EXPERT_TRAIN_EPISODES,
+                    frame_stride=4,
+                ),
+                num_batches=5,
+            ),
+            EvalDataConfig(
+                "seal/heldin",
+                _rss_generalist_source_config(
+                    task_slug="seal-water-bottle-cap",
+                    episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES,
+                    frame_stride=4,
+                ),
+                num_batches=5,
+            ),
+            EvalDataConfig(
+                "hanoi/heldin",
+                _rss_generalist_source_config(
+                    task_slug="tower-of-hanoi-game",
+                    episodes=_TOWER_MEMORY_EXPERT_TRAIN_EPISODES,
+                    frame_stride=4,
+                ),
+                num_batches=5,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_RSS_GENERALIST_CHECKPOINT_DIR}/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-6,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+        num_train_steps=100_000,
+        batch_size=32,
+        num_workers=64,
+        log_interval=50,
+        eval_interval=1_000,
+        num_eval_batches=15,
+        num_heldin_eval_batches=5,
+        save_interval=5_000,
+        keep_period=5_000,
+    )
+)
+
 _SEAL_MEMORY42_PHASE2_CONFIG = next(
     config for config in _CONFIGS if config.name == "pi05_seal-water-bottle-cap_memory42_phase2_bc"
 )
@@ -2387,6 +2623,67 @@ _CONFIGS.append(
         num_train_steps=50_000,
         num_eval_batches=30,
         num_heldin_eval_batches=10,
+        keep_period=5_000,
+    )
+)
+
+_CONFIGS.append(
+    TrainConfig(
+        name="pi05_tower-of-hanoi-game_nomem_phase2_bc_lr5e6",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=MixtureDataConfig(
+            repo_id="tower-of-hanoi-game/nomem-expert-phase2",
+            source_weights=(0.47, 0.21, 0.07, 0.25),
+            data_configs=(
+                _rss_nomem_source_config(
+                    task_slug="tower-of-hanoi-game",
+                    checkpoint_subdir="hanoi_200k",
+                    episodes=_TOWER_MEMORY_EXPERT_TRAIN_EPISODES,
+                    frame_stride=2,
+                ),
+                _rss_nomem_source_config(
+                    task_slug="tower-of-hanoi-game",
+                    checkpoint_subdir="hanoi_200k",
+                    episodes=_TOWER_MEMORY_HIL_SUFFIX_TRAIN_EPISODES,
+                ),
+                _rss_nomem_source_config(
+                    task_slug="tower-of-hanoi-game",
+                    checkpoint_subdir="hanoi_200k",
+                    episodes=_TOWER_MEMORY_SUCCESS_TRAIN_EPISODES,
+                ),
+                _rss_nomem_phase2_source_config(
+                    task_slug="tower-of-hanoi-game",
+                    phase2_slug="tower_of_hanoi_game",
+                    checkpoint_subdir="hanoi_200k",
+                ),
+            ),
+        ),
+        eval_data=_rss_nomem_source_config(
+            task_slug="tower-of-hanoi-game",
+            checkpoint_subdir="hanoi_200k",
+            episodes=_TOWER_MEMORY_EXPERT_VAL_EPISODES,
+        ),
+        heldin_eval_data=_rss_nomem_source_config(
+            task_slug="tower-of-hanoi-game",
+            checkpoint_subdir="hanoi_200k",
+            episodes=_TOWER_MEMORY_EXPERT_TRAIN_EPISODES,
+            frame_stride=2,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_RSS_SECOND_SUBMIT_CHECKPOINT_ROOT}/hanoi_200k/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-6,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+        num_train_steps=50_000,
+        batch_size=32,
+        num_workers=64,
+        log_interval=50,
+        eval_interval=500,
+        num_eval_batches=30,
+        num_heldin_eval_batches=10,
+        save_interval=5_000,
         keep_period=5_000,
     )
 )

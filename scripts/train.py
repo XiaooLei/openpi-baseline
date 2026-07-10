@@ -311,6 +311,24 @@ def main(config: _config.TrainConfig):
             data_config_factory=config.heldin_eval_data,
             num_workers=min(config.num_workers, 8),
         )
+    extra_eval_data_loaders = []
+    if config.eval_interval > 0:
+        for index, eval_config in enumerate(config.extra_eval_data):
+            extra_eval_data_loaders.append(
+                (
+                    eval_config.name,
+                    _data_loader.create_data_loader(
+                        config,
+                        sharding=data_sharding,
+                        shuffle=eval_config.shuffle,
+                        num_batches=eval_config.num_batches or config.num_eval_batches,
+                        data_config_factory=eval_config.data,
+                        num_workers=min(config.num_workers, 8),
+                    ),
+                    10 + index,
+                    False,
+                )
+            )
 
     # Log images from first batch to sanity check.
     images_to_log = [
@@ -367,10 +385,12 @@ def main(config: _config.TrainConfig):
             if step % config.eval_interval == 0 and step > start_step:
                 try:
                     all_eval_metrics = {}
-                    for split_name, eval_data_loader, rng_fold, include_legacy in (
+                    eval_loaders = [
                         ("heldout", heldout_eval_data_loader, 0, True),
                         ("heldin", heldin_eval_data_loader, 1, False),
-                    ):
+                        *extra_eval_data_loaders,
+                    ]
+                    for split_name, eval_data_loader, rng_fold, include_legacy in eval_loaders:
                         if eval_data_loader is None:
                             continue
                         eval_infos = []
