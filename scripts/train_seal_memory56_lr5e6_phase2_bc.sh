@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+
+export CONFIG=${CONFIG:-pi05_seal-water-bottle-cap_memory56_phase2_bc_lr5e6}
+export EXP_NAME=${EXP_NAME:-seal_memory56_60_120_240_water120_phase2_bc_lr5e6}
+export NUM_TRAIN_STEPS=${NUM_TRAIN_STEPS:-50000}
+
+exec "$(dirname "$0")/train_seal_memory_phase2_bc.sh"

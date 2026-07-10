@@ -334,10 +334,9 @@ def main(config: _config.TrainConfig):
     )
 
     peval_step = jax.jit(
-        eval_step,
+        functools.partial(eval_step, log_per_dim_metrics=config.log_eval_per_dim_metrics),
         in_shardings=(replicated_sharding, train_state_sharding.params, replicated_sharding, data_sharding),
         out_shardings=replicated_sharding,
-        static_argnames=("log_per_dim_metrics",),
     )
 
     start_step = int(train_state.step)
@@ -379,13 +378,7 @@ def main(config: _config.TrainConfig):
                         for eval_batch in eval_data_loader:
                             eval_rng, batch_rng = jax.random.split(eval_rng)
                             with sharding.set_mesh(mesh):
-                                eval_info = peval_step(
-                                    train_state.model_def,
-                                    train_state.params,
-                                    batch_rng,
-                                    eval_batch,
-                                    log_per_dim_metrics=config.log_eval_per_dim_metrics,
-                                )
+                                eval_info = peval_step(train_state.model_def, train_state.params, batch_rng, eval_batch)
                             eval_infos.append(eval_info)
                         stacked_eval = common_utils.stack_forest(eval_infos)
                         reduced_eval = flatten_metrics(

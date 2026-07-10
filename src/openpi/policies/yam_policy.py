@@ -247,6 +247,45 @@ class SparseYamStateDeltaContext(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class YamStateMemoryIntoState(transforms.DataTransformFn):
+    """Packs selected sparse proprioceptive deltas into unused slots of the 32-dim pi05 state."""
+
+    state_history_delta_indices: tuple[int, ...] = (-120, -60, 0)
+    delta_pairs: tuple[tuple[int, int], ...] = ((0, -60), (0, -120))
+    selected_state_indices: tuple[int, ...] = (7, 8, 9, 10, 11, 12, 13, 5, 6)
+    base_state_dim: int = 14
+
+    def __call__(self, data: dict) -> dict:
+        if "state_history" not in data:
+            return data
+
+        state = np.asarray(data["state"]).copy()
+        state_history = np.asarray(data.pop("state_history"))
+        selected_indices = np.asarray(self.selected_state_indices, dtype=np.int64)
+
+        offset_to_index = {offset: index for index, offset in enumerate(self.state_history_delta_indices)}
+        deltas = []
+        for newer_offset, older_offset in self.delta_pairs:
+            if newer_offset not in offset_to_index or older_offset not in offset_to_index:
+                raise ValueError(
+                    f"Delta pair {(newer_offset, older_offset)} is not covered by "
+                    f"state_history_delta_indices={self.state_history_delta_indices}."
+                )
+            newer_index = offset_to_index[newer_offset]
+            older_index = offset_to_index[older_offset]
+            deltas.append((state_history[newer_index] - state_history[older_index])[..., selected_indices])
+
+        memory = np.concatenate(deltas, axis=-1)
+        end_dim = self.base_state_dim + memory.shape[-1]
+        if state.shape[-1] < end_dim:
+            raise ValueError(f"Cannot pack {memory.shape[-1]} memory dims into state with shape {state.shape}.")
+
+        state[..., self.base_state_dim : end_dim] = memory
+        data["state"] = state
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class YamOutputs(transforms.DataTransformFn):
     """Outputs for the World Engine's Yam policy."""
 

@@ -477,6 +477,84 @@ class DualYamMemoryDataConfig(DualYamDataConfig):
             observation_delta_indices=observation_delta_indices,
         )
 
+
+@dataclasses.dataclass(frozen=True)
+class DualYamStateMemoryDataConfig(DualYamMemoryDataConfig):
+    """Dual-arm YAM data config that packs sparse proprioception deltas into the 32-dim pi05 state."""
+
+    selected_state_indices: Sequence[int] = (7, 8, 9, 10, 11, 12, 13, 5, 6)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        history_indices = tuple(self.state_history_delta_indices)
+        if 0 not in history_indices:
+            raise ValueError("state_history_delta_indices must include 0 so delta actions can use the current state.")
+        current_state_index = history_indices.index(0)
+        missing_delta_offsets = {
+            offset for pair in self.state_delta_pairs for offset in pair if offset not in history_indices
+        }
+        if missing_delta_offsets:
+            raise ValueError(
+                f"state_delta_pairs reference offsets not present in state_history_delta_indices: "
+                f"{sorted(missing_delta_offsets)}"
+            )
+
+        base_config = self.create_base_config(assets_dirs, model_config)
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                yam_policy.YamMemoryInputs(
+                    action_dim=model_config.action_dim,
+                    adapt_to_pi=self.adapt_to_pi,
+                    model_type=model_config.model_type,
+                    current_state_index=current_state_index,
+                )
+            ],
+            outputs=[yam_policy.YamOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        state_history_norm = []
+        if base_config.norm_stats is not None and "state" in base_config.norm_stats:
+            state_history_norm = [
+                _transforms.Normalize(
+                    {"state_history": base_config.norm_stats["state"]},
+                    use_quantiles=base_config.use_quantile_norm,
+                )
+            ]
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        model_transforms = _transforms.Group(
+            inputs=[
+                *state_history_norm,
+                yam_policy.YamStateMemoryIntoState(
+                    state_history_delta_indices=history_indices,
+                    delta_pairs=tuple(self.state_delta_pairs),
+                    selected_state_indices=tuple(self.selected_state_indices),
+                ),
+                *model_transforms.inputs,
+            ],
+            outputs=model_transforms.outputs,
+        )
+
+        observation_delta_indices = dict(base_config.observation_delta_indices)
+        observation_delta_indices["observation.state"] = history_indices
+
+        return dataclasses.replace(
+            base_config,
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            observation_delta_indices=observation_delta_indices,
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
     """
@@ -824,6 +902,8 @@ _SEAL_MEMORY_SUCCESS_TRAIN_EPISODES = tuple(
 )
 _SEAL_MEMORY70_HISTORY_INDICES = (-120, -60, -30, -15, 0)
 _SEAL_MEMORY70_DELTA_PAIRS = ((0, -15), (-15, -30), (-30, -60), (-60, -120))
+_SEAL_MEMORY56_HISTORY_INDICES = (-240, -120, -60, 0)
+_SEAL_MEMORY56_DELTA_PAIRS = ((0, -60), (0, -120), (0, -240))
 _SEAL_MEMORY42_HISTORY_INDICES = (-120, -60, 0)
 _SEAL_MEMORY42_DELTA_PAIRS = ((0, -60), (0, -120))
 _RSS_DATA_ROOT = os.environ.get(
@@ -968,6 +1048,52 @@ def _rss_memory_source_config(
     )
 
 
+def _rss_state_memory_source_config(
+    *,
+    task_slug: str,
+    checkpoint_subdir: str,
+    episodes: Sequence[int] | None,
+    state_history_delta_indices: Sequence[int],
+    state_delta_pairs: Sequence[tuple[int, int]],
+    frame_stride: int = 1,
+) -> DualYamStateMemoryDataConfig:
+    return DualYamStateMemoryDataConfig(
+        repo_id=f"{task_slug}/expert-success-hil-suffix-mix-data",
+        base_config=DataConfig(
+            prompt_from_task=True,
+            local_files_path=f"{_RSS_RAW_DATA_ROOT}/{task_slug}/expert-success-hil-suffix-mix-data",
+            episodes=episodes,
+            frame_stride=frame_stride,
+        ),
+        assets=_rss_second_submit_assets(task_slug, checkpoint_subdir),
+        state_history_delta_indices=state_history_delta_indices,
+        state_delta_pairs=state_delta_pairs,
+        use_delta_joint_actions=True,
+        adapt_to_pi=True,
+    )
+
+
+def _rss_nomem_source_config(
+    *,
+    task_slug: str,
+    checkpoint_subdir: str,
+    episodes: Sequence[int] | None,
+    frame_stride: int = 1,
+) -> DualYamDataConfig:
+    return DualYamDataConfig(
+        repo_id=f"{task_slug}/expert-success-hil-suffix-mix-data",
+        base_config=DataConfig(
+            prompt_from_task=True,
+            local_files_path=f"{_RSS_RAW_DATA_ROOT}/{task_slug}/expert-success-hil-suffix-mix-data",
+            episodes=episodes,
+            frame_stride=frame_stride,
+        ),
+        assets=_rss_second_submit_assets(task_slug, checkpoint_subdir),
+        use_delta_joint_actions=True,
+        adapt_to_pi=True,
+    )
+
+
 def _rss_memory_phase2_source_config(
     *,
     task_slug: str,
@@ -1064,8 +1190,8 @@ def _rss_memory_phase2_bc_config(
         log_interval=50,
         eval_interval=500,
         num_eval_batches=10,
-        save_interval=20_000,
-        keep_period=50_000,
+        save_interval=5_000,
+        keep_period=5_000,
         policy_metadata={
             "state_history_delta_indices": tuple(state_history_delta_indices),
         },
@@ -1152,8 +1278,8 @@ _CONFIGS = [
         log_interval=50,
         eval_interval=500,
         num_eval_batches=10,
-        save_interval=20_000,
-        keep_period=50_000,
+        save_interval=5_000,
+        keep_period=5_000,
         policy_metadata={
             "state_history_delta_indices": _SEAL_MEMORY70_HISTORY_INDICES,
         },
@@ -1278,8 +1404,8 @@ _CONFIGS = [
         log_interval=50,
         eval_interval=500,
         num_eval_batches=10,
-        save_interval=20_000,
-        keep_period=50_000,
+        save_interval=5_000,
+        keep_period=5_000,
         policy_metadata={
             "state_history_delta_indices": _SEAL_MEMORY42_HISTORY_INDICES,
         },
@@ -1404,8 +1530,8 @@ _CONFIGS = [
         log_interval=50,
         eval_interval=500,
         num_eval_batches=10,
-        save_interval=20_000,
-        keep_period=50_000,
+        save_interval=5_000,
+        keep_period=5_000,
         policy_metadata={
             "state_history_delta_indices": _SEAL_MEMORY70_HISTORY_INDICES,
         },
@@ -1516,7 +1642,7 @@ _CONFIGS = [
         num_train_steps=100_000,
         batch_size=32,
         num_workers=64,
-        save_interval=20_000,
+        save_interval=5_000,
     ),
     TrainConfig(
         name="pi05_rss_multitask_ft",
@@ -1535,7 +1661,7 @@ _CONFIGS = [
         num_train_steps=100_000,
         batch_size=32,
         num_workers=64,
-        save_interval=20_000,
+        save_interval=5_000,
     ),
     #
     # Inference Aloha configs.
@@ -1834,7 +1960,7 @@ _CONFIGS = [
         batch_size=256,
         log_interval=100,
         save_interval=5000,
-        keep_period=20_000,
+        keep_period=5_000,
         num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
     ),
     TrainConfig(
@@ -2121,6 +2247,60 @@ _CONFIGS = [
 _SEAL_MEMORY42_PHASE2_CONFIG = next(
     config for config in _CONFIGS if config.name == "pi05_seal-water-bottle-cap_memory42_phase2_bc"
 )
+
+
+def _replace_memory_history(
+    data_config: DataConfig | MixtureDataConfig | None,
+    *,
+    state_history_delta_indices: Sequence[int],
+    state_delta_pairs: Sequence[tuple[int, int]],
+) -> DataConfig | MixtureDataConfig | None:
+    if isinstance(data_config, MixtureDataConfig):
+        return dataclasses.replace(
+            data_config,
+            data_configs=tuple(
+                _replace_memory_history(
+                    source_config,
+                    state_history_delta_indices=state_history_delta_indices,
+                    state_delta_pairs=state_delta_pairs,
+                )
+                for source_config in data_config.data_configs
+            ),
+        )
+    if isinstance(data_config, DualYamMemoryDataConfig):
+        return dataclasses.replace(
+            data_config,
+            state_history_delta_indices=state_history_delta_indices,
+            state_delta_pairs=state_delta_pairs,
+        )
+    return data_config
+
+
+_SEAL_MEMORY56_PHASE2_CONFIG = dataclasses.replace(
+    _SEAL_MEMORY42_PHASE2_CONFIG,
+    name="pi05_seal-water-bottle-cap_memory56_phase2_bc",
+    model=pi0_config.Pi0Config(pi05=True, max_token_len=280),
+    data=_replace_memory_history(
+        _SEAL_MEMORY42_PHASE2_CONFIG.data,
+        state_history_delta_indices=_SEAL_MEMORY56_HISTORY_INDICES,
+        state_delta_pairs=_SEAL_MEMORY56_DELTA_PAIRS,
+    ),
+    eval_data=_replace_memory_history(
+        _SEAL_MEMORY42_PHASE2_CONFIG.eval_data,
+        state_history_delta_indices=_SEAL_MEMORY56_HISTORY_INDICES,
+        state_delta_pairs=_SEAL_MEMORY56_DELTA_PAIRS,
+    ),
+    heldin_eval_data=_replace_memory_history(
+        _SEAL_MEMORY42_PHASE2_CONFIG.heldin_eval_data,
+        state_history_delta_indices=_SEAL_MEMORY56_HISTORY_INDICES,
+        state_delta_pairs=_SEAL_MEMORY56_DELTA_PAIRS,
+    ),
+    policy_metadata={
+        "state_history_delta_indices": _SEAL_MEMORY56_HISTORY_INDICES,
+    },
+)
+_CONFIGS.append(_SEAL_MEMORY56_PHASE2_CONFIG)
+
 _CONFIGS.append(
     dataclasses.replace(
         _SEAL_MEMORY42_PHASE2_CONFIG,
@@ -2131,10 +2311,222 @@ _CONFIGS.append(
             decay_steps=60_000,
             decay_lr=5e-6,
         ),
-        num_train_steps=60_000,
+        num_train_steps=50_000,
         num_eval_batches=30,
         num_heldin_eval_batches=10,
-        keep_period=20_000,
+        keep_period=5_000,
+    )
+)
+
+_CONFIGS.append(
+    dataclasses.replace(
+        _SEAL_MEMORY56_PHASE2_CONFIG,
+        name="pi05_seal-water-bottle-cap_memory56_phase2_bc_lr5e6",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-6,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+        num_train_steps=50_000,
+        num_eval_batches=30,
+        num_heldin_eval_batches=10,
+        keep_period=5_000,
+    )
+)
+
+_SEAL_MEMORY70_PHASE2_CONFIG = next(
+    config for config in _CONFIGS if config.name == "pi05_seal-water-bottle-cap_memory70_phase2_bc"
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        _SEAL_MEMORY70_PHASE2_CONFIG,
+        name="pi05_seal-water-bottle-cap_memory70_phase2_bc_lr5e6",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-6,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+        num_train_steps=50_000,
+        num_eval_batches=30,
+        num_heldin_eval_batches=10,
+        keep_period=5_000,
+    )
+)
+
+_CONFIGS.append(
+    TrainConfig(
+        name="pi05_seal-water-bottle-cap_memory42_expert-success_lr5e6",
+        model=pi0_config.Pi0Config(pi05=True, max_token_len=240),
+        data=MixtureDataConfig(
+            repo_id="seal-water-bottle-cap/memory42-expert-success",
+            source_weights=(0.85, 0.15),
+            data_configs=(
+                _rss_memory_source_config(
+                    task_slug="seal-water-bottle-cap",
+                    checkpoint_subdir="water_120k",
+                    episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES,
+                    frame_stride=2,
+                    state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+                    state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+                ),
+                _rss_memory_source_config(
+                    task_slug="seal-water-bottle-cap",
+                    checkpoint_subdir="water_120k",
+                    episodes=_SEAL_MEMORY_SUCCESS_TRAIN_EPISODES,
+                    state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+                    state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+                ),
+            ),
+        ),
+        eval_data=_rss_memory_source_config(
+            task_slug="seal-water-bottle-cap",
+            checkpoint_subdir="water_120k",
+            episodes=_SEAL_MEMORY_EXPERT_VAL_EPISODES,
+            state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+            state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+        ),
+        heldin_eval_data=_rss_memory_source_config(
+            task_slug="seal-water-bottle-cap",
+            checkpoint_subdir="water_120k",
+            episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES,
+            frame_stride=2,
+            state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+            state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_SEAL_WATER120_CHECKPOINT_DIR}/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-6,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+        num_train_steps=60_000,
+        batch_size=32,
+        num_workers=64,
+        log_interval=50,
+        eval_interval=500,
+        num_eval_batches=30,
+        num_heldin_eval_batches=10,
+        save_interval=5_000,
+        keep_period=5_000,
+        policy_metadata={
+            "state_history_delta_indices": _SEAL_MEMORY42_HISTORY_INDICES,
+        },
+    )
+)
+
+_CONFIGS.append(
+    TrainConfig(
+        name="pi05_seal-water-bottle-cap_nomem_expert-success_lr5e6",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=MixtureDataConfig(
+            repo_id="seal-water-bottle-cap/nomem-expert-success",
+            source_weights=(0.85, 0.15),
+            data_configs=(
+                _rss_nomem_source_config(
+                    task_slug="seal-water-bottle-cap",
+                    checkpoint_subdir="water_120k",
+                    episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES,
+                    frame_stride=2,
+                ),
+                _rss_nomem_source_config(
+                    task_slug="seal-water-bottle-cap",
+                    checkpoint_subdir="water_120k",
+                    episodes=_SEAL_MEMORY_SUCCESS_TRAIN_EPISODES,
+                ),
+            ),
+        ),
+        eval_data=_rss_nomem_source_config(
+            task_slug="seal-water-bottle-cap",
+            checkpoint_subdir="water_120k",
+            episodes=_SEAL_MEMORY_EXPERT_VAL_EPISODES,
+        ),
+        heldin_eval_data=_rss_nomem_source_config(
+            task_slug="seal-water-bottle-cap",
+            checkpoint_subdir="water_120k",
+            episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES,
+            frame_stride=2,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_SEAL_WATER120_CHECKPOINT_DIR}/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-6,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+        num_train_steps=60_000,
+        batch_size=32,
+        num_workers=64,
+        log_interval=50,
+        eval_interval=500,
+        num_eval_batches=30,
+        num_heldin_eval_batches=10,
+        save_interval=5_000,
+        keep_period=5_000,
+    )
+)
+
+_CONFIGS.append(
+    TrainConfig(
+        name="pi05_seal-water-bottle-cap_state32mem18_expert-success_lr5e6",
+        model=pi0_config.Pi0Config(pi05=True, max_token_len=240),
+        data=MixtureDataConfig(
+            repo_id="seal-water-bottle-cap/state32mem18-expert-success",
+            source_weights=(0.85, 0.15),
+            data_configs=(
+                _rss_state_memory_source_config(
+                    task_slug="seal-water-bottle-cap",
+                    checkpoint_subdir="water_120k",
+                    episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES,
+                    frame_stride=2,
+                    state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+                    state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+                ),
+                _rss_state_memory_source_config(
+                    task_slug="seal-water-bottle-cap",
+                    checkpoint_subdir="water_120k",
+                    episodes=_SEAL_MEMORY_SUCCESS_TRAIN_EPISODES,
+                    state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+                    state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+                ),
+            ),
+        ),
+        eval_data=_rss_state_memory_source_config(
+            task_slug="seal-water-bottle-cap",
+            checkpoint_subdir="water_120k",
+            episodes=_SEAL_MEMORY_EXPERT_VAL_EPISODES,
+            state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+            state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+        ),
+        heldin_eval_data=_rss_state_memory_source_config(
+            task_slug="seal-water-bottle-cap",
+            checkpoint_subdir="water_120k",
+            episodes=_SEAL_MEMORY_EXPERT_TRAIN_EPISODES,
+            frame_stride=2,
+            state_history_delta_indices=_SEAL_MEMORY42_HISTORY_INDICES,
+            state_delta_pairs=_SEAL_MEMORY42_DELTA_PAIRS,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_SEAL_WATER120_CHECKPOINT_DIR}/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-6,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+        num_train_steps=60_000,
+        batch_size=32,
+        num_workers=64,
+        log_interval=50,
+        eval_interval=500,
+        num_eval_batches=30,
+        num_heldin_eval_batches=10,
+        save_interval=5_000,
+        keep_period=5_000,
+        policy_metadata={
+            "state_history_delta_indices": _SEAL_MEMORY42_HISTORY_INDICES,
+        },
     )
 )
 
